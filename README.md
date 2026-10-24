@@ -3,7 +3,7 @@ Assortment of tools for 3D Movie Maker modding.
 ## 3DMM Exporter for Maverick Model 3D
 Exports actors and props with animations from Maverick Model 3D (successor of Misfit Model 3D) to 3DMM.
 
-**Linux only** for now. Help build the Windows DLL [here](/mm3d_plugin/README.md)!
+**Linux only** for now. Help build the Windows DLL [here](/mm3d_plugin/README.md#Windows%20support)!
 
 (Coming soon: dedicated export dialog for easier options)
 
