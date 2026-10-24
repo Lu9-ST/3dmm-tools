@@ -118,15 +118,15 @@ Assign these from `Edit → Model Meta Data`, all are optional.
 - `3DMM_MOTION_SCALE` = multiplier for default actor mode, factoring for the stock motion's jumps/slides (default: your height / the stock actor's height)
 - `3DMM_DITHER` = `1` for Floyd-Steinberg dithering on textures (default: plain nearest colour posterize)
 - `3DMM_DITHER:<material name>` = `0`/`1` overrides the dither option for one texture (its `~` skins follow)
-- `3DMM_TEXSIZE` / `3DMM_TEXPOW2`: see [Textures](/#Textures)
+- `3DMM_TEXSIZE` / `3DMM_TEXPOW2`: see [Textures](/mm3d_plugin/README.md#Textures)
 - `3DMM_PREVIEW` = path to an image file for the picker thumbnail (default: a front render of the model)
 - `3DMM_ANIMS` = `none` to skip animations (default: unset)
 - `3DMM_PROP_ANIMS` = `1` appends the stock prop animations (Grow, Grow Fast, Shrink, Shrink Fast, Spin, Spin Fast, Squash, Stretch) unless you already have one with that name (default actor mode also has them) (default: unset)
-- `3DMM_ACTOR_ANIMS` = `1` will enable default actor mode and map the default actor animations to joints. (See [Default actor mode (experimental)](</#Default%20actor%20mode%20(experimental)>)) May need the following option too. (default: unset)
+- `3DMM_ACTOR_ANIMS` = `1` will enable default actor mode and map the default actor animations to joints. (See [Default actor mode (experimental)](</mm3d_plugin/README.md#Default%20actor%20mode%20(experimental)>)) May need the following option too. (default: unset)
 - `3DMM_STOCK` = path to `tmpls.3cn` (only needed by default actor mode) (default: common paths to `Microsoft Kids/3D Movie Maker`)
 - `3DMM_DWR` = distance per cel of stationary actions (default 2.5)
 - `3DMM_CNO` = chunk number base (default derived from the name)
-- `3DMM_FIT`, `3DMM_FIT_TOL`, `3DMM_SKIN`, `3DMM_SKELETON`, `3DMM_STOCK_ACTOR` (only Frank's layout is supported) and `3DMM_MAP:<name>`: see [Default actor mode (experimental)](</#Default%20actor%20mode%20(experimental)>).
+- `3DMM_FIT`, `3DMM_FIT_TOL`, `3DMM_SKIN`, `3DMM_SKELETON`, `3DMM_STOCK_ACTOR` (only Frank's layout is supported) and `3DMM_MAP:<name>`: see [Default actor mode (experimental)](</mm3d_plugin/README.md#Default%20actor%20mode%20(experimental)>).
 
 ## Windows support
 
