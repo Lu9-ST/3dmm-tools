@@ -31,7 +31,9 @@ the group's texture. Joints without triangles become empty parts. Skeletal anima
 cels. Frame animations still work (a model may have both, the skeleton then stays at rest during frame animations).
 Triangles of unbound vertices stay on the root. Seams between joints are not blended, keep that in mind
 (overlapping limbs, caps at joints).
+
 Setting `3DMM_SKELETON` `0` ignores joints and exports by group as before. (More on that below)
+
 Set `#N` on group names as usual to choose which costume set a piece belongs to. Empty joint parts are in set 0.
 
 ## Animations
@@ -41,6 +43,7 @@ plays, advancing that many 3DMM units per cel (by default: Walk Fast = 1.0, Run 
 The action is saved as "Name *" which is how 3DMM does it.
 `3DMM_STEP:<name>` = distance does the same from metadata,
 `3DMM_STEP` sets the default step (1.0). Without a `*` the action is assumed stationary.
+
 An animation named "At Rest" is created automatically, but you can make an animation with that name to override it.
 
 ## Textures
@@ -48,6 +51,7 @@ An animation named "At Rest" is created automatically, but you can make an anima
 Textures keep their size (rows are padded to a multiple of 4 pixels like the stock textures), and are converted to
 the shared 3DMM palette. `3DMM_TEXSIZE` sets a maximum width/height, `3DMM_TEXPOW2` = `1` rounds sizes to powers of
 two. Pixels with alpha below 50% become the texture's one transparent color (palette index 0).
+
 Faces with no group become a part called "ungrouped". Color (non-texture) materials become flat textures.
 
 ## Default actor mode (experimental)
@@ -86,6 +90,7 @@ torso (the log lists them). `3DMM_MAP:<joint or group name>` = `part name/number
 | 25, 26 shoe (L, R)               | foot, feet, shoe, sole, toe                                                                     |
 
 (left = the character's left; for a model facing +Z that is +X. A joint whose L/R word is on the wrong side makes the stock motion mirrored, the export log warns about it.) Parts you do not fill stay empty. A joint called spine (or torso, chest ...) marks the waist: the torso turns around it, and geometry bound to the hip joint is split into hips and torso at its height (without one: at the hip joint).
+
 Joints whose name is known also tell the exporter where the pivot of that part is, so the motion turns around _your_ shoulder, hip, ... instead of Frank's.
 
 ### Proportions and size
@@ -94,6 +99,7 @@ Your actor does not have to match/look like Frank or any other actor. Joints nam
 _your_ shoulder, elbow, hip, neck, etc. are, and the motion turns around those. The head, torso, hips and shoes are
 separate pieces in the stock data (they are only held together by Frank's proportions), so the exporter ties them
 into a chain of its own (hips → torso → head, boot → shoe).
+
 The actor is fitted to Frank's height unless you set `3DMM_HEIGHT`. Jumps and other slides of the stock motion are scaled by your height / Frank's height (`3DMM_MOTION_SCALE` overrides that factor).
 
 ### Costume sets
@@ -131,8 +137,9 @@ Assign these from `Edit → Model Meta Data`, all are optional.
 ## Windows support
 
 I'm on Linux, so I built `3dmm.so`. To build a Windows version, `mm3d.exe` has to export functions that a DLL can call, and the pre-built release doesn't. The plug-in needs 40 of them, they're in `win/mm3d_exports.def`).
-For a Windows build: build Maverick Model 3D with MSYS2 as described in its `INSTALL.WIN32`, link it once with the export list and an import library (the exact command is in the header of `build_win.sh`), then run `build_win.sh` in the
-"MSYS2 MinGW 64-bit" shell and copy `3dmm.dll` to `plugins\1.3\` next to `mm3d.exe`. The sources compile for Windows and the DLL links against the export list in a cross-compile here, but it has not been run on Windows yet.
+
+For a Windows build: build Maverick Model 3D with MSYS2 as described in its `INSTALL.WIN32`, link it once with the export list and an import library (the exact command is in the header of `build_win.sh`), then run `build_win.sh` in the "MSYS2 MinGW 64-bit" shell and copy `3dmm.dll` to `plugins\1.3\` next to `mm3d.exe`. The sources compile for Windows and the DLL links against the export list in a cross-compile here, but it has not been run on Windows yet.
+
 `tmpls.3cn` is looked for next to the model, in `3DMM_STOCK`, and in usual 3DMM / 3DMMEx folders.
 
 ## Credits
