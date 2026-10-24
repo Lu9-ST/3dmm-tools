@@ -1,0 +1,1199 @@
+diff --git a/inc/utest.h b/inc/utest.h
+index c437c18..12b6b52 100644
+--- a/inc/utest.h
++++ b/inc/utest.h
+@@ -96,6 +96,23 @@ class KWA : public KWA_PAR
+ #define kszFrameInterpolationVertex PszLit("FrameInterpolationVertex")
+ #define klwFrameInterpolationVertexDefault 1
+ 
++// Directory with v3DMM expansions (.vxp files) to load.  When empty (the
++// default), it is a VXP directory in the Microsoft Kids directory.  The files
++// inside the VXPs are unpacked into the Expansions source when the program
++// starts, only if they are new or changed (see vxp.h).
++#define kszVxpPath PszLit("VxpPath")
++#define kszVxpDirDefault PszLit("VXP")
++
++// If not 0, start without the building (no login, closet or lobby): straight
++// into the studio with a new movie that has the black background ("Black
++// Screen") as its first scene.  Does nothing if a movie file is given on the
++// command line.
++#define kszQuickNew PszLit("QuickNew")
++#define klwQuickNewDefault 0
++
++// Chunk number of the black background ("GE-Black Background") in bkgds.3cn
++#define kcnoBkgdBlack 11
++
+ // FGetSetRegKey flags
+ enum
+ {
+@@ -219,6 +236,7 @@ class APP : public APP_PAR
+     bool _FGetUserName(void);
+     bool _FGetUserDirectories(void);
+     bool _FReadUserData(void);
++    void _InstallVxps(void);
+     bool _FWriteUserData(void);
+     bool _FDisplayHomeLogo(void);
+     bool _FDetermineIfSlowCPU(void);
+diff --git a/inc/vxp.h b/inc/vxp.h
+new file mode 100644
+index 0000000..d272ea5
+--- /dev/null
++++ b/inc/vxp.h
+@@ -0,0 +1,38 @@
++/* Copyright (c) Microsoft Corporation.
++   Licensed under the MIT License. */
++
++/*************************************************************************
++
++    vxp.h: Support for v3DMM expansions (.vxp files).
++
++    A VXP is a zip file with a .3cn and .3th pair (plus a .cfg for v3DMM's
++    own launcher, which is ignored here).  3DMM reads content from files
++    on disk, through offsets in the file, so a VXP can't be read in place
++    from the zip.  Instead FVxpInstall unpacks the .3cn and .3th files to
++    the "Expansions" source (the directory 3DMM already loads sid 5 content
++    from).  Only when a VXP is new or changed: the unpacked files are named
++    after the VXP and the crc of the file, so an unchanged VXP costs reading
++    its directory (a few KB).  Unpacked files whose VXP is gone are
++    deleted.
++
++*************************************************************************/
++#ifndef VXP_H
++#define VXP_H
++
++struct VXPSTATS
++{
++    int32_t cVxp;       // .vxp files found
++    int32_t cFiles;     // files they should have unpacked
++    int32_t cUnpacked;  // files unpacked this time
++    int32_t cRemoved;   // unpacked files deleted because their VXP is gone or changed
++    int32_t cFailed;    // VXPs or files with problems (see the log file)
++    int32_t cConflicts; // chunks in more than one VXP
++};
++
++// pfniMsKids: the Microsoft Kids directory.  pfniVxpDir: where the .vxp
++// files are.  Doesn't touch anything if there are no VXPs and no unpacked
++// files to clean up.  Problems are not fatal; they are written to
++// vxp-log.txt in the VXP directory and counted in pstats.
++void VxpInstall(PFNI pfniMsKids, PFNI pfniVxpDir, VXPSTATS *pstats);
++
++#endif // VXP_H
+diff --git a/inc/zipread.h b/inc/zipread.h
+new file mode 100644
+index 0000000..e7f8fc1
+--- /dev/null
++++ b/inc/zipread.h
+@@ -0,0 +1,438 @@
++/* Copyright (c) Microsoft Corporation.
++   Licensed under the MIT License. */
++
++/*************************************************************************
++
++    zipread.h: Just enough of the zip format to read a VXP (v3DMM
++    expansion): crc32, inflate, and parsing the central directory.
++    Header-only, no dependencies on the rest of the engine, so it can be
++    tested on its own.
++
++    Not supported: zip64, encryption, multi-disk archives, compression
++    methods other than "stored" and "deflate".
++
++*************************************************************************/
++#ifndef ZIPREAD_H
++#define ZIPREAD_H
++
++#include <cstdint>
++#include <cstddef>
++#include <cstring>
++#include <string>
++#include <vector>
++
++namespace zipread
++{
++
++/***************************************************************************
++    CRC-32 (the one zip uses).  Pass the previous result as crc to continue.
++***************************************************************************/
++inline uint32_t Crc32(const uint8_t *pb, size_t cb, uint32_t crc = 0)
++{
++    static uint32_t rgt[256];
++    static bool fInit = false;
++    if (!fInit)
++    {
++        for (uint32_t i = 0; i < 256; i++)
++        {
++            uint32_t c = i;
++            for (int k = 0; k < 8; k++)
++                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
++            rgt[i] = c;
++        }
++        fInit = true;
++    }
++    crc = ~crc;
++    for (size_t i = 0; i < cb; i++)
++        crc = rgt[(crc ^ pb[i]) & 0xFF] ^ (crc >> 8);
++    return ~crc;
++}
++
++/***************************************************************************
++    Inflate (RFC 1951), after Mark Adler's "puff".  Decompresses exactly
++    cbOut bytes (the size the zip directory promised) and fails if the data
++    is invalid, ends early or doesn't produce exactly that many bytes.
++***************************************************************************/
++class Inflater
++{
++  private:
++    static const int kMaxBits = 15;
++    static const int kMaxLCodes = 286;
++    static const int kMaxDCodes = 30;
++    static const int kFixLCodes = 288;
++
++    struct Huff
++    {
++        int16_t count[kMaxBits + 1];
++        int16_t symbol[kFixLCodes];
++    };
++
++    const uint8_t *_pbIn;
++    size_t _cbIn;
++    size_t _ibIn;
++    uint8_t *_pbOut;
++    size_t _cbOut;
++    size_t _ibOut;
++    uint32_t _bitBuf;
++    int _bitCnt;
++    bool _fFail;
++
++    int _Bits(int need)
++    {
++        uint32_t val = _bitBuf;
++        while (_bitCnt < need)
++        {
++            if (_ibIn >= _cbIn)
++            {
++                _fFail = true;
++                return 0;
++            }
++            val |= (uint32_t)_pbIn[_ibIn++] << _bitCnt;
++            _bitCnt += 8;
++        }
++        _bitBuf = val >> need;
++        _bitCnt -= need;
++        return (int)(val & ((1u << need) - 1));
++    }
++
++    // Returns the number of unused codes (negative if over-subscribed)
++    static int _Construct(Huff *h, const int16_t *length, int n)
++    {
++        int16_t offs[kMaxBits + 1];
++        int left = 1;
++
++        for (int len = 0; len <= kMaxBits; len++)
++            h->count[len] = 0;
++        for (int symbol = 0; symbol < n; symbol++)
++            h->count[length[symbol]]++;
++        if (h->count[0] == n)
++            return 0;
++        for (int len = 1; len <= kMaxBits; len++)
++        {
++            left <<= 1;
++            left -= h->count[len];
++            if (left < 0)
++                return left;
++        }
++        offs[1] = 0;
++        for (int len = 1; len < kMaxBits; len++)
++            offs[len + 1] = offs[len] + h->count[len];
++        for (int symbol = 0; symbol < n; symbol++)
++            if (length[symbol] != 0)
++                h->symbol[offs[length[symbol]]++] = (int16_t)symbol;
++        return left;
++    }
++
++    int _Decode(const Huff *h)
++    {
++        int code = 0, first = 0, index = 0;
++        for (int len = 1; len <= kMaxBits; len++)
++        {
++            code |= _Bits(1);
++            if (_fFail)
++                return -1;
++            int count = h->count[len];
++            if (code - count < first)
++                return h->symbol[index + (code - first)];
++            index += count;
++            first += count;
++            first <<= 1;
++            code <<= 1;
++        }
++        _fFail = true;
++        return -1;
++    }
++
++    bool _Codes(const Huff *lencode, const Huff *distcode)
++    {
++        static const int16_t lens[29] = {3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
++                                         31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
++        static const int16_t lext[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
++                                         2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
++        static const int16_t dists[30] = {1,   2,   3,   4,   5,   7,    9,    13,   17,   25,
++                                          33,  49,  65,  97,  129, 193,  257,  385,  513,  769,
++                                          1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
++        static const int16_t dext[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6,
++                                         6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
++        for (;;)
++        {
++            int symbol = _Decode(lencode);
++            if (_fFail || symbol < 0)
++                return false;
++            if (symbol < 256)
++            {
++                if (_ibOut >= _cbOut)
++                    return false;
++                _pbOut[_ibOut++] = (uint8_t)symbol;
++            }
++            else if (symbol == 256)
++            {
++                return true;
++            }
++            else
++            {
++                symbol -= 257;
++                if (symbol >= 29)
++                    return false;
++                int len = lens[symbol] + _Bits(lext[symbol]);
++                symbol = _Decode(distcode);
++                if (_fFail || symbol < 0)
++                    return false;
++                size_t dist = (size_t)dists[symbol] + (size_t)_Bits(dext[symbol]);
++                if (_fFail || dist > _ibOut || _ibOut + (size_t)len > _cbOut)
++                    return false;
++                for (int i = 0; i < len; i++, _ibOut++)
++                    _pbOut[_ibOut] = _pbOut[_ibOut - dist];
++            }
++        }
++    }
++
++    bool _Stored(void)
++    {
++        _bitBuf = 0;
++        _bitCnt = 0;
++        if (_ibIn + 4 > _cbIn)
++            return false;
++        uint32_t len = _pbIn[_ibIn] | (_pbIn[_ibIn + 1] << 8);
++        uint32_t nlen = _pbIn[_ibIn + 2] | (_pbIn[_ibIn + 3] << 8);
++        _ibIn += 4;
++        if (len != (~nlen & 0xFFFF))
++            return false;
++        if (_ibIn + len > _cbIn || _ibOut + len > _cbOut)
++            return false;
++        memcpy(_pbOut + _ibOut, _pbIn + _ibIn, len);
++        _ibIn += len;
++        _ibOut += len;
++        return true;
++    }
++
++    bool _Fixed(void)
++    {
++        Huff lencode, distcode;
++        int16_t lengths[kFixLCodes];
++        int symbol;
++        for (symbol = 0; symbol < 144; symbol++)
++            lengths[symbol] = 8;
++        for (; symbol < 256; symbol++)
++            lengths[symbol] = 9;
++        for (; symbol < 280; symbol++)
++            lengths[symbol] = 7;
++        for (; symbol < kFixLCodes; symbol++)
++            lengths[symbol] = 8;
++        _Construct(&lencode, lengths, kFixLCodes);
++        for (symbol = 0; symbol < kMaxDCodes; symbol++)
++            lengths[symbol] = 5;
++        _Construct(&distcode, lengths, kMaxDCodes);
++        return _Codes(&lencode, &distcode);
++    }
++
++    bool _Dynamic(void)
++    {
++        static const int16_t order[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
++        int16_t lengths[kMaxLCodes + kMaxDCodes];
++        Huff lencode, distcode;
++
++        int nlen = _Bits(5) + 257;
++        int ndist = _Bits(5) + 1;
++        int ncode = _Bits(4) + 4;
++        if (_fFail || nlen > kMaxLCodes || ndist > kMaxDCodes)
++            return false;
++
++        int index;
++        for (index = 0; index < ncode; index++)
++            lengths[order[index]] = (int16_t)_Bits(3);
++        for (; index < 19; index++)
++            lengths[order[index]] = 0;
++        if (_fFail)
++            return false;
++        if (_Construct(&lencode, lengths, 19) != 0)
++            return false;
++
++        index = 0;
++        while (index < nlen + ndist)
++        {
++            int symbol = _Decode(&lencode);
++            if (_fFail || symbol < 0)
++                return false;
++            if (symbol < 16)
++            {
++                lengths[index++] = (int16_t)symbol;
++            }
++            else
++            {
++                int len = 0, rep;
++                if (symbol == 16)
++                {
++                    if (index == 0)
++                        return false;
++                    len = lengths[index - 1];
++                    rep = 3 + _Bits(2);
++                }
++                else if (symbol == 17)
++                {
++                    rep = 3 + _Bits(3);
++                }
++                else
++                {
++                    rep = 11 + _Bits(7);
++                }
++                if (_fFail || index + rep > nlen + ndist)
++                    return false;
++                while (rep--)
++                    lengths[index++] = (int16_t)len;
++            }
++        }
++        if (lengths[256] == 0)
++            return false;
++
++        int err = _Construct(&lencode, lengths, nlen);
++        if (err < 0 || (err > 0 && nlen - lencode.count[0] != 1))
++            return false;
++        err = _Construct(&distcode, lengths + nlen, ndist);
++        if (err < 0 || (err > 0 && ndist - distcode.count[0] != 1))
++            return false;
++        return _Codes(&lencode, &distcode);
++    }
++
++  public:
++    bool FInflate(const uint8_t *pbIn, size_t cbIn, uint8_t *pbOut, size_t cbOut)
++    {
++        _pbIn = pbIn;
++        _cbIn = cbIn;
++        _ibIn = 0;
++        _pbOut = pbOut;
++        _cbOut = cbOut;
++        _ibOut = 0;
++        _bitBuf = 0;
++        _bitCnt = 0;
++        _fFail = false;
++
++        int last;
++        do
++        {
++            last = _Bits(1);
++            int type = _Bits(2);
++            if (_fFail)
++                return false;
++            bool f;
++            switch (type)
++            {
++            case 0:
++                f = _Stored();
++                break;
++            case 1:
++                f = _Fixed();
++                break;
++            case 2:
++                f = _Dynamic();
++                break;
++            default:
++                f = false;
++                break;
++            }
++            if (!f || _fFail)
++                return false;
++        } while (!last);
++        return _ibOut == _cbOut;
++    }
++};
++
++inline bool FInflate(const uint8_t *pbIn, size_t cbIn, uint8_t *pbOut, size_t cbOut)
++{
++    Inflater inf;
++    return inf.FInflate(pbIn, cbIn, pbOut, cbOut);
++}
++
++/***************************************************************************
++    The central directory of a zip file
++***************************************************************************/
++struct ZipEntry
++{
++    std::string name;
++    uint16_t method;   // 0 stored, 8 deflate
++    uint16_t grf;      // general purpose flags
++    uint32_t crc;      // crc32 of the uncompressed data
++    uint32_t cbPacked; // compressed size
++    uint32_t cbSize;   // uncompressed size
++    uint32_t ibLocal;  // where the local header is
++};
++
++inline uint32_t Le16(const uint8_t *pb)
++{
++    return pb[0] | (pb[1] << 8);
++}
++inline uint32_t Le32(const uint8_t *pb)
++{
++    return pb[0] | (pb[1] << 8) | (pb[2] << 16) | ((uint32_t)pb[3] << 24);
++}
++
++// Finds the "end of central directory" record in the last bytes of a zip
++// (pbTail, cbTail), and returns where the central directory is and how
++// many entries it has.
++inline bool FFindEocd(const uint8_t *pbTail, size_t cbTail, uint32_t *pibDir, uint32_t *pcbDir, uint32_t *pcent)
++{
++    if (cbTail < 22)
++        return false;
++    for (size_t i = cbTail - 22 + 1; i-- > 0;)
++    {
++        if (Le32(pbTail + i) == 0x06054b50)
++        {
++            uint32_t cbComment = Le16(pbTail + i + 20);
++            if (i + 22 + cbComment > cbTail)
++                continue; // can't be the real one
++            if (Le16(pbTail + i + 4) != 0 || Le16(pbTail + i + 6) != 0)
++                return false; // multi-disk
++            uint32_t cent = Le16(pbTail + i + 10);
++            uint32_t cbDir = Le32(pbTail + i + 12);
++            uint32_t ibDir = Le32(pbTail + i + 16);
++            if (cent == 0xFFFF || cbDir == 0xFFFFFFFFu || ibDir == 0xFFFFFFFFu)
++                return false; // zip64
++            *pcent = cent;
++            *pcbDir = cbDir;
++            *pibDir = ibDir;
++            return true;
++        }
++    }
++    return false;
++}
++
++inline bool FParseDirectory(const uint8_t *pb, size_t cb, uint32_t cent, std::vector<ZipEntry> *pvec)
++{
++    size_t ib = 0;
++    pvec->clear();
++    for (uint32_t i = 0; i < cent; i++)
++    {
++        if (ib + 46 > cb || Le32(pb + ib) != 0x02014b50)
++            return false;
++        ZipEntry e;
++        e.grf = (uint16_t)Le16(pb + ib + 8);
++        e.method = (uint16_t)Le16(pb + ib + 10);
++        e.crc = Le32(pb + ib + 16);
++        e.cbPacked = Le32(pb + ib + 20);
++        e.cbSize = Le32(pb + ib + 24);
++        uint32_t cbName = Le16(pb + ib + 28);
++        uint32_t cbExtra = Le16(pb + ib + 30);
++        uint32_t cbComment = Le16(pb + ib + 32);
++        e.ibLocal = Le32(pb + ib + 42);
++        if (ib + 46 + cbName + cbExtra + cbComment > cb)
++            return false;
++        e.name.assign((const char *)pb + ib + 46, cbName);
++        pvec->push_back(e);
++        ib += 46 + cbName + cbExtra + cbComment;
++    }
++    return true;
++}
++
++// Given the 30 fixed bytes of a local file header, the number of bytes from
++// the local header to the file data.
++inline bool FLocalHeaderSize(const uint8_t *pb30, uint32_t *pcb)
++{
++    if (Le32(pb30) != 0x04034b50)
++        return false;
++    *pcb = 30 + Le16(pb30 + 26) + Le16(pb30 + 28);
++    return true;
++}
++
++} // namespace zipread
++
++#endif // ZIPREAD_H
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index c102cac..abcffca 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -103,6 +103,7 @@ target_sources(studio
+     "${PROJECT_SOURCE_DIR}/src/studio/tatr.cpp"
+     "${PROJECT_SOURCE_DIR}/src/studio/tgob.cpp"
+     "${PROJECT_SOURCE_DIR}/src/studio/utest.cpp"
++    "${PROJECT_SOURCE_DIR}/src/studio/vxp.cpp"
+ )
+ if (WIN32)
+     set_target_properties(
+diff --git a/src/studio/utest.cpp b/src/studio/utest.cpp
+index 4d997e8..a3b5ddc 100644
+--- a/src/studio/utest.cpp
++++ b/src/studio/utest.cpp
+@@ -18,6 +18,7 @@
+ ***************************************************************************/
+ #include "studio.h"
+ #include "socres.h"
++#include "vxp.h"
+ 
+ #ifdef KAUAI_WIN32
+ #include "mminstal.h"
+@@ -202,6 +203,7 @@ bool APP::_FInit(uint32_t grfapp, uint32_t grfgob, int32_t ginDef)
+     uint32_t tsSplashScreen;
+     FNI fniUserDoc;
+     int32_t fFirstTimeUser;
++    int32_t fQuickNew = 0;
+     int32_t dtsDelay;
+ 
+     // Load startup preferences
+@@ -406,6 +408,12 @@ bool APP::_FInit(uint32_t grfapp, uint32_t grfgob, int32_t ginDef)
+         goto LFail;
+     }
+ 
++    // Unpack new or changed v3DMM expansions (.vxp) before anything reads
++    // the Expansions content.  Not fatal.
++    _InstallVxps();
++
++    (void)FGetSetRegKey(kszQuickNew, &fQuickNew, SIZEOF(fQuickNew), fregNil);
++
+     if (!_FInitCrm())
+     {
+         _FGenericError(PszLit("_FInitCrm"));
+@@ -426,7 +434,9 @@ bool APP::_FInit(uint32_t grfapp, uint32_t grfgob, int32_t ginDef)
+     // to the studio.  Otherwise, start the building.
+     GetPortfolioDoc(&fniUserDoc);
+ 
+-    if (fniUserDoc.Ftg() == ftgNil)
++    // Quick New (ini file): skip the building and start the studio with a new
++    // movie.  Only when there is no movie file to open.
++    if (fniUserDoc.Ftg() == ftgNil && fQuickNew == 0)
+     {
+         // Startup place depends on whether this is the user's first time in.
+         if (!FGetProp(kpridFirstTimeUser, &fFirstTimeUser))
+@@ -463,6 +473,26 @@ bool APP::_FInit(uint32_t grfapp, uint32_t grfgob, int32_t ginDef)
+             _fDontReportInitFailure = fTrue;
+             goto LFail;
+         }
++
++        if (fniUserDoc.Ftg() == ftgNil && _pstdio != pvNil)
++        {
++            // Quick New: the first scene is the black background.  Same
++            // command the background browser sends.
++            TAGF tagf;
++            CMD cmd;
++
++            tagf.sid = SidProduct();
++            tagf._pcrf = pvNil;
++            tagf.ctg = kctgBkgd;
++            tagf.cno = kcnoBkgdBlack;
++
++            ClearPb(&cmd, SIZEOF(cmd));
++            cmd.cid = cidNewScene;
++            cmd.pcmh = _pstdio;
++            Assert(SIZEOF(TAGF) <= SIZEOF(cmd.rglw), "Insufficient space in rglw");
++            *((TAGF *)&cmd.rglw) = tagf;
++            vpcex->EnqueueCmd(&cmd);
++        }
+     }
+ 
+     EnsureInteractive();
+@@ -1373,6 +1403,40 @@ struct UDAT
+     int32_t rglw[kcpridUserData];
+ };
+ 
++/***************************************************************************
++    Unpacks the v3DMM expansions (.vxp files) in the VXP directory into the
++    Expansions source, see vxp.h.  The directory is the VxpPath ini setting,
++    or a "VXP" directory in the Microsoft Kids directory if that is empty.
++***************************************************************************/
++void APP::_InstallVxps(void)
++{
++    AssertBaseThis(0);
++
++    SZ szPath;
++    STN stn;
++    FNI fniVxp;
++    VXPSTATS vxpstats;
++    bool fHaveDir = fFalse;
++
++    szPath[0] = chNil;
++    if (FGetSetRegKey(kszVxpPath, szPath, SIZEOF(szPath), fregString))
++    {
++        stn.SetSz(szPath);
++        if (stn.Cch() > 0)
++            fHaveDir = fniVxp.FBuildFromPath(&stn, kftgDir);
++    }
++    if (!fHaveDir)
++    {
++        // (a missing directory is fine: no expansions, but unpacked files of
++        // VXPs that are gone are still cleaned up)
++        _fniMsKidsDir.GetStnPath(&stn);
++        if (!stn.FAppendSz(kszVxpDirDefault) || !fniVxp.FBuildFromPath(&stn, kftgDir))
++            return;
++    }
++
++    VxpInstall(&_fniMsKidsDir, &fniVxp, &vxpstats);
++}
++
+ /***************************************************************************
+     Reads the "user data" from the registry and SetProp's the data onto
+     the app
+diff --git a/src/studio/vxp.cpp b/src/studio/vxp.cpp
+new file mode 100644
+index 0000000..7f9d5da
+--- /dev/null
++++ b/src/studio/vxp.cpp
+@@ -0,0 +1,545 @@
++/* Copyright (c) Microsoft Corporation.
++   Licensed under the MIT License. */
++
++/***************************************************************************
++
++    vxp.cpp: Support for v3DMM expansions (.vxp files), see vxp.h
++
++***************************************************************************/
++
++#include "studio.h"
++#include "zipread.h"
++#include "vxp.h"
++
++#include <cstdarg>
++#include <cstdio>
++#include <cstring>
++#include <deque>
++#include <exception>
++#include <map>
++#include <set>
++#include <string>
++#include <vector>
++
++ASSERTNAME
++
++#define kftgVxp KLCONST3('v', 'x', 'p')
++#define kftgVxpTemp KLCONST3('v', 't', 'p')
++
++static const char kszVxpPrefix[] = "vxp_";
++static const char kszVxpLog[] = "vxp-log";
++
++// Biggest file we will unpack (it is unpacked in memory)
++static const uint32_t kcbVxpMaxFile = 0x30000000;
++
++// A file in a VXP that has to be unpacked
++struct VXPENT
++{
++    std::string stnFile; // name it is unpacked as (with extension)
++    FTG ftg;
++    zipread::ZipEntry zent;
++    int32_t ivxp; // which VXP it came from (index into the list of VXPs)
++};
++
++static std::string StdLower(std::string s)
++{
++    for (size_t i = 0; i < s.size(); i++)
++    {
++        if (s[i] >= 'A' && s[i] <= 'Z')
++            s[i] = (char)(s[i] - 'A' + 'a');
++    }
++    return s;
++}
++
++static bool FEndsWith(const std::string &s, const char *pszEnd)
++{
++    size_t cch = strlen(pszEnd);
++    return s.size() >= cch && s.compare(s.size() - cch, cch, pszEnd) == 0;
++}
++
++static std::string StdFormat(const char *pszFmt, ...)
++{
++    char sz[1024];
++    va_list args;
++    va_start(args, pszFmt);
++    vsnprintf(sz, sizeof(sz), pszFmt, args);
++    va_end(args);
++    return sz;
++}
++
++// Makes a name that is safe in a file name on any platform
++static std::string StdSafeName(const std::string &s)
++{
++    std::string sOut;
++    for (size_t i = 0; i < s.size() && sOut.size() < 32; i++)
++    {
++        char ch = s[i];
++        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_')
++            sOut += ch;
++        else
++            sOut += '_';
++    }
++    if (sOut.empty())
++        sOut = "vxp";
++    return sOut;
++}
++
++// Sets *pfni to the file (name with the extension) in the directory pfniDir
++static bool FFniInDir(PFNI pfniDir, const std::string &stnFile, FNI *pfni)
++{
++    size_t ichDot = stnFile.rfind('.');
++    if (ichDot == std::string::npos)
++        return fFalse;
++    std::string stnBase = stnFile.substr(0, ichDot);
++    std::string stnExt = StdLower(stnFile.substr(ichDot + 1));
++    FTG ftg = 0; // (not ftgNil, which isn't 0)
++    for (size_t i = 0; i < stnExt.size(); i++)
++        ftg = (ftg << 8) | (uint8_t)stnExt[i];
++
++    STN stn;
++    stn.SetSz(stnBase.c_str());
++    *pfni = *pfniDir;
++    return pfni->FSetLeaf(&stn, ftg);
++}
++
++// Reads one VXP's directory and adds the files to unpack to *pvecEnt.
++// Returns fFalse (with a message in *psError) if this isn't a usable zip.
++static bool FReadVxp(PFNI pfni, int32_t ivxp, std::vector<VXPENT> *pvecEnt, std::string *psError)
++{
++    PFIL pfil = FIL::PfilOpen(pfni);
++    bool fRet = fFalse;
++    std::vector<uint8_t> vecTail;
++    std::vector<uint8_t> vecDir;
++    std::vector<zipread::ZipEntry> vecZent;
++    uint32_t ibDir, cbDir, cent;
++    FP fpMac, fpTail;
++    int32_t cbTail;
++    STN stnLeaf;
++    std::string sVxp;
++    int cFound = 0;
++
++    if (pvNil == pfil)
++    {
++        *psError = "can't open the file";
++        return fFalse;
++    }
++    try
++    {
++        fpMac = pfil->FpMac();
++        cbTail = fpMac < 66000 ? fpMac : 66000;
++        fpTail = fpMac - cbTail;
++        vecTail.resize(cbTail);
++        if (cbTail < 22 || !pfil->FReadRgb(vecTail.data(), cbTail, fpTail))
++        {
++            *psError = "can't read the file, or it isn't a zip";
++            goto LDone;
++        }
++        if (!zipread::FFindEocd(vecTail.data(), cbTail, &ibDir, &cbDir, &cent) ||
++            (uint64_t)ibDir + cbDir > (uint64_t)fpMac)
++        {
++            *psError = "not a (plain) zip file";
++            goto LDone;
++        }
++        vecDir.resize(cbDir);
++        if ((cbDir > 0 && !pfil->FReadRgb(vecDir.data(), (int32_t)cbDir, (FP)ibDir)) ||
++            !zipread::FParseDirectory(vecDir.data(), cbDir, cent, &vecZent))
++        {
++            *psError = "damaged zip directory";
++            goto LDone;
++        }
++
++        pfni->GetLeaf(&stnLeaf);
++        sVxp = stnLeaf.Psz();
++        if (FEndsWith(StdLower(sVxp), ".vxp"))
++            sVxp.erase(sVxp.size() - 4);
++        sVxp = StdSafeName(sVxp);
++
++        for (size_t i = 0; i < vecZent.size(); i++)
++        {
++            const zipread::ZipEntry &z = vecZent[i];
++            std::string sName = StdLower(z.name);
++            FTG ftg;
++            const char *pszExt;
++
++            if (FEndsWith(sName, ".3cn"))
++            {
++                ftg = kftgContent;
++                pszExt = "3cn";
++            }
++            else if (FEndsWith(sName, ".3th"))
++            {
++                ftg = kftgThumbDesc;
++                pszExt = "3th";
++            }
++            else
++            {
++                continue;
++            }
++            if (sName.compare(0, 9, "__macosx/") == 0 || sName.find("/._") != std::string::npos)
++                continue;
++            if (z.grf & 1)
++            {
++                *psError = "encrypted zips aren't supported";
++                goto LDone;
++            }
++            if (z.method != 0 && z.method != 8)
++            {
++                *psError = "unsupported compression method";
++                goto LDone;
++            }
++            if (z.cbSize > kcbVxpMaxFile || z.cbPacked > kcbVxpMaxFile)
++            {
++                *psError = "a file inside is too big";
++                goto LDone;
++            }
++            VXPENT ent;
++            ent.stnFile = StdFormat("%s%s_%08x.%s", kszVxpPrefix, sVxp.c_str(), (unsigned)z.crc, pszExt);
++            ent.ftg = ftg;
++            ent.zent = z;
++            ent.ivxp = ivxp;
++            // two entries that are identical in content and name (can't be told apart): keep one
++            bool fDup = fFalse;
++            for (size_t j = 0; j < pvecEnt->size(); j++)
++                fDup = fDup || ((*pvecEnt)[j].stnFile == ent.stnFile);
++            if (!fDup)
++                pvecEnt->push_back(ent);
++            cFound++;
++        }
++        if (cFound == 0)
++        {
++            *psError = "no .3cn or .3th files inside";
++            goto LDone;
++        }
++        fRet = fTrue;
++    }
++    catch (const std::exception &)
++    {
++        *psError = "out of memory";
++        fRet = fFalse;
++    }
++LDone:
++    ReleasePpo(&pfil);
++    return fRet;
++}
++
++// Writes cb bytes to a new file (replacing any old one)
++static bool FWriteFile(PFNI pfni, const uint8_t *pb, uint32_t cb)
++{
++    PFIL pfil = FIL::PfilCreate(pfni);
++    bool fRet = fTrue;
++    uint32_t ib = 0;
++
++    if (pvNil == pfil)
++        return fFalse;
++    while (ib < cb && fRet)
++    {
++        uint32_t cbT = cb - ib < 0x100000 ? cb - ib : 0x100000;
++        fRet = pfil->FWriteRgb(pb + ib, (int32_t)cbT, (FP)ib);
++        ib += cbT;
++    }
++    ReleasePpo(&pfil);
++    return fRet;
++}
++
++// Reads, checks and writes one file of a VXP, to the (temporary) pfniTmp
++static bool FUnpackEntry(PFNI pfniVxp, const VXPENT &ent, PFNI pfniTmp, std::string *psError)
++{
++    PFIL pfil = FIL::PfilOpen(pfniVxp);
++    bool fRet = fFalse;
++    uint8_t rgbHdr[30];
++    uint32_t cbHdr;
++    FP fpMac;
++
++    if (pvNil == pfil)
++    {
++        *psError = "can't open the file";
++        return fFalse;
++    }
++    try
++    {
++        fpMac = pfil->FpMac();
++        if ((uint64_t)ent.zent.ibLocal + 30 > (uint64_t)fpMac ||
++            !pfil->FReadRgb(rgbHdr, 30, (FP)ent.zent.ibLocal) || !zipread::FLocalHeaderSize(rgbHdr, &cbHdr) ||
++            (uint64_t)ent.zent.ibLocal + cbHdr + ent.zent.cbPacked > (uint64_t)fpMac)
++        {
++            *psError = "damaged zip entry";
++            goto LDone;
++        }
++        std::vector<uint8_t> vecPacked(ent.zent.cbPacked);
++        std::vector<uint8_t> vecData(ent.zent.cbSize);
++        if (ent.zent.cbPacked > 0 &&
++            !pfil->FReadRgb(vecPacked.data(), (int32_t)ent.zent.cbPacked, (FP)(ent.zent.ibLocal + cbHdr)))
++        {
++            *psError = "can't read the file";
++            goto LDone;
++        }
++        if (ent.zent.method == 0)
++        {
++            if (ent.zent.cbPacked != ent.zent.cbSize)
++            {
++                *psError = "damaged zip entry";
++                goto LDone;
++            }
++            if (ent.zent.cbSize > 0)
++                memcpy(vecData.data(), vecPacked.data(), ent.zent.cbSize);
++        }
++        else if (!zipread::FInflate(vecPacked.data(), vecPacked.size(), vecData.data(), vecData.size()))
++        {
++            *psError = "damaged compressed data";
++            goto LDone;
++        }
++        if (zipread::Crc32(vecData.data(), vecData.size()) != ent.zent.crc)
++        {
++            *psError = "crc mismatch";
++            goto LDone;
++        }
++        if (!FWriteFile(pfniTmp, vecData.data(), (uint32_t)vecData.size()))
++        {
++            *psError = "can't write the file";
++            goto LDone;
++        }
++        fRet = fTrue;
++    }
++    catch (const std::exception &)
++    {
++        *psError = "out of memory";
++        fRet = fFalse;
++    }
++LDone:
++    ReleasePpo(&pfil);
++    return fRet;
++}
++
++// The directory 3DMM reads the "Expansions" source from, the same way TAGM
++// finds it: the long name first, then the short one.
++static bool FFindExpansionsDir(PFNI pfniMsKids, bool fCreate, FNI *pfniOut)
++{
++    STN stnLong = PszLit("Expansions");
++    STN stnShort = PszLit("EXPANSIONS");
++
++    *pfniOut = *pfniMsKids;
++    if (pfniOut->FDownDir(&stnLong, ffniMoveToDir))
++        return fTrue;
++    *pfniOut = *pfniMsKids;
++    if (pfniOut->FDownDir(&stnShort, ffniMoveToDir))
++        return fTrue;
++    if (!fCreate)
++        return fFalse;
++    *pfniOut = *pfniMsKids;
++    return pfniOut->FDownDir(&stnLong, ffniMoveToDir | ffniCreateDir);
++}
++
++static void WriteLog(PFNI pfniVxpDir, const std::vector<std::string> &vecLog)
++{
++    if (vecLog.empty())
++        return;
++    std::string s = "3DMMEx VXP loader\n\n";
++    for (size_t i = 0; i < vecLog.size(); i++)
++        s += vecLog[i] + "\n";
++
++    FNI fni;
++    if (!FFniInDir(pfniVxpDir, std::string(kszVxpLog) + ".txt", &fni))
++        return;
++    // ignore failure (the folder may be read only)
++    (void)FWriteFile(&fni, (const uint8_t *)s.data(), (uint32_t)s.size());
++}
++
++// Reports chunks that are in more than one of the unpacked .3cn files.  3DMM
++// uses the first one it finds, so only one of them is seen.
++static int32_t CConflicts(PFNI pfniDir, const std::vector<VXPENT> &vecEnt, std::vector<std::string> *pvecLog)
++{
++    std::map<std::pair<uint32_t, uint32_t>, int32_t> mpOwner; // (ctg, cno) -> index in vecEnt
++    int32_t cConflicts = 0;
++
++    for (size_t ient = 0; ient < vecEnt.size(); ient++)
++    {
++        if (vecEnt[ient].ftg != kftgContent)
++            continue;
++        FNI fni;
++        if (!FFniInDir(pfniDir, vecEnt[ient].stnFile, &fni))
++            continue;
++        PCFL pcfl = CFL::PcflOpen(&fni, fcflNil);
++        if (pvNil == pcfl)
++            continue;
++        int32_t ccki = pcfl->Ccki();
++        std::map<int32_t, std::pair<int32_t, std::string>> mpClash; // other file -> (count, an example)
++        for (int32_t icki = 0; icki < ccki; icki++)
++        {
++            CKI cki;
++            if (!pcfl->FGetCki(icki, &cki))
++                continue;
++            auto key = std::make_pair((uint32_t)cki.ctg, (uint32_t)cki.cno);
++            auto it = mpOwner.find(key);
++            if (it == mpOwner.end())
++            {
++                mpOwner[key] = (int32_t)ient;
++            }
++            else if (it->second != (int32_t)ient)
++            {
++                cConflicts++;
++                auto &clash = mpClash[it->second];
++                if (clash.first++ == 0)
++                {
++                    clash.second = StdFormat("%c%c%c%c %u", (char)(cki.ctg >> 24), (char)(cki.ctg >> 16),
++                                             (char)(cki.ctg >> 8), (char)cki.ctg, (unsigned)cki.cno);
++                }
++            }
++        }
++        for (auto &kv : mpClash)
++        {
++            pvecLog->push_back(StdFormat("conflict: %d chunks of %s have the same type and number as chunks of %s "
++                                         "(for example %s). 3DMM will only use one of each pair.",
++                                         (int)kv.second.first, vecEnt[ient].stnFile.c_str(),
++                                         vecEnt[kv.first].stnFile.c_str(), kv.second.second.c_str()));
++        }
++        ReleasePpo(&pcfl);
++    }
++    return cConflicts;
++}
++
++void VxpInstall(PFNI pfniMsKids, PFNI pfniVxpDir, VXPSTATS *pstats)
++{
++    AssertPo(pfniMsKids, ffniDir);
++    AssertPo(pfniVxpDir, ffniDir);
++    AssertVarMem(pstats);
++
++    std::deque<FNI> vecFniVxp; // FNI can be assigned but not copy constructed
++    std::vector<VXPENT> vecEnt;
++    std::vector<std::string> vecLog;
++    FNI fniExp;
++    bool fHaveExp;
++    bool fChanged = fFalse;
++
++    ClearPb(pstats, SIZEOF(VXPSTATS));
++
++    // What VXPs are there?  (a missing directory is the same as an empty one:
++    // then only old unpacked files are cleaned up)
++    if (pfniVxpDir->TExists() == tYes)
++    {
++        FNE fne;
++        FNI fni;
++        FTG ftgVxp = kftgVxp;
++        if (fne.FInit(pfniVxpDir, &ftgVxp, 1))
++        {
++            while (fne.FNextFni(&fni))
++            {
++                vecFniVxp.emplace_back();
++                vecFniVxp.back() = fni;
++            }
++        }
++    }
++    pstats->cVxp = (int32_t)vecFniVxp.size();
++
++    for (size_t ivxp = 0; ivxp < vecFniVxp.size(); ivxp++)
++    {
++        std::string sError;
++        STN stnLeaf;
++        vecFniVxp[ivxp].GetLeaf(&stnLeaf);
++        if (!FReadVxp(&vecFniVxp[ivxp], (int32_t)ivxp, &vecEnt, &sError))
++        {
++            pstats->cFailed++;
++            vecLog.push_back(StdFormat("%s: skipped, %s", stnLeaf.Psz(), sError.c_str()));
++        }
++    }
++    pstats->cFiles = (int32_t)vecEnt.size();
++
++    fHaveExp = FFindExpansionsDir(pfniMsKids, !vecEnt.empty(), &fniExp);
++    if (!fHaveExp)
++    {
++        if (!vecEnt.empty())
++        {
++            pstats->cFailed++;
++            vecLog.push_back("can't find or create the Expansions directory");
++        }
++        WriteLog(pfniVxpDir, vecLog);
++        return;
++    }
++
++    // Delete unpacked files that don't belong to any VXP now (a VXP that was
++    // removed or replaced, or a half written file)
++    {
++        FNE fne;
++        FNI fni;
++        FTG rgftg[3] = {kftgContent, kftgThumbDesc, kftgVxpTemp};
++        std::set<std::string> setWanted;
++        std::deque<FNI> vecDelete;
++
++        for (size_t i = 0; i < vecEnt.size(); i++)
++            setWanted.insert(vecEnt[i].stnFile);
++
++        if (fne.FInit(&fniExp, rgftg, 3))
++        {
++            while (fne.FNextFni(&fni))
++            {
++                STN stnLeaf;
++                fni.GetLeaf(&stnLeaf);
++                std::string sLeaf = stnLeaf.Psz();
++                if (sLeaf.compare(0, strlen(kszVxpPrefix), kszVxpPrefix) != 0)
++                    continue; // not ours
++                if (setWanted.count(sLeaf) == 0 || FEndsWith(StdLower(sLeaf), ".vtp"))
++                {
++                    vecDelete.emplace_back();
++                    vecDelete.back() = fni;
++                }
++            }
++        }
++        for (size_t i = 0; i < vecDelete.size(); i++)
++        {
++            if (vecDelete[i].FDelete())
++            {
++                pstats->cRemoved++;
++                fChanged = fTrue;
++            }
++        }
++    }
++
++    // Unpack what isn't there yet
++    for (size_t ient = 0; ient < vecEnt.size(); ient++)
++    {
++        const VXPENT &ent = vecEnt[ient];
++        FNI fniOut, fniTmp;
++        std::string sError;
++
++        if (!FFniInDir(&fniExp, ent.stnFile, &fniOut))
++            continue;
++        if (fniOut.TExists() == tYes)
++        {
++            // same name means same crc; also check the size
++            PFIL pfil = FIL::PfilOpen(&fniOut);
++            bool fSame = (pvNil != pfil) && (pfil->FpMac() == (FP)ent.zent.cbSize);
++            ReleasePpo(&pfil);
++            if (fSame)
++                continue;
++            (void)fniOut.FDelete();
++        }
++
++        std::string sTmp = ent.stnFile.substr(0, ent.stnFile.rfind('.')) + ".vtp";
++        if (!FFniInDir(&fniExp, sTmp, &fniTmp))
++            continue;
++        STN stnVxpLeaf;
++        vecFniVxp[ent.ivxp].GetLeaf(&stnVxpLeaf);
++
++        if (!FUnpackEntry(&vecFniVxp[ent.ivxp], ent, &fniTmp, &sError) || !fniTmp.FRename(&fniOut))
++        {
++            if (sError.empty())
++                sError = "can't rename the file";
++            pstats->cFailed++;
++            vecLog.push_back(StdFormat("%s: couldn't unpack %s: %s", stnVxpLeaf.Psz(), ent.zent.name.c_str(),
++                                       sError.c_str()));
++            if (fniTmp.TExists() == tYes)
++                (void)fniTmp.FDelete();
++            continue;
++        }
++        pstats->cUnpacked++;
++        fChanged = fTrue;
++        vecLog.push_back(StdFormat("%s: unpacked %s as %s", stnVxpLeaf.Psz(), ent.zent.name.c_str(),
++                                   ent.stnFile.c_str()));
++    }
++
++    // Look for clashes only when something is new
++    if (fChanged)
++        pstats->cConflicts = CConflicts(&fniExp, vecEnt, &vecLog);
++
++    if (fChanged || pstats->cFailed > 0)
++        WriteLog(pfniVxpDir, vecLog);
++}

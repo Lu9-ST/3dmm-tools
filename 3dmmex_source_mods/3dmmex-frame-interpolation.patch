@@ -1,0 +1,2417 @@
+diff --git a/inc/actor.h b/inc/actor.h
+index 8ac9b81..52acfbe 100644
+--- a/inc/actor.h
++++ b/inc/actor.h
+@@ -349,6 +349,14 @@ struct SMM
+ /***********************************************
+    Actor Class
+ ***********************************************/
++// What HoldPose did (see ACTR)
++enum
++{
++    kimaskNone = 0,
++    kimaskHidden = 1, // hid the body of an actor that appeared during the step
++    kimaskShown = 2   // showed the body of an actor that disappeared during the step
++};
++
+ typedef class ACTR *PACTR;
+ #define ACTR_PAR BASE
+ #define kclsACTR KLCONST4('A', 'C', 'T', 'R')
+@@ -393,6 +401,11 @@ class ACTR : public ACTR_PAR
+     int32_t _iaevFrmMin;     // First event in current frame
+     int32_t _iaevActnCur;    // Event defining current action
+     int32_t _iaevAddCur;     // Most recent add (useful for Compose)
++    int32_t _rgiaevAddInterp[2]; // _iaevAddCur at CapturePose time (frame interpolation)
++    bool _rgfOnStageInterp[2];   // _fOnStage at CapturePose time (frame interpolation)
++    BRS _dwrLastStep;            // Step distance used by the most recent _FDoFrm
++    int32_t _diffInterp;         // How the last captured step should be shown (kpose*)
++    int32_t _imaskInterp;        // What HoldPose did to the body, for EndHold to undo (kimask*)
+     RTEL _rtelCur;           // Current location on route	(excludes tweak info)
+     XYZ _xyzCur;             // Last point displayed (may be tweak modified)
+     XFRM _xfrm;              // Current transformation
+@@ -598,6 +611,31 @@ class ACTR : public ACTR_PAR
+         AssertBaseThis(0);
+         return _pbody;
+     }
++
++    // Frame interpolation.  Capture before and after a frame step (slot 0
++    // and 1), then blend between them or restore one exactly.
++    void CapturePose(int32_t ipose, float rJumpLimit = 0.0f);
++    int32_t DiffPoses(void)
++    {
++        AssertBaseThis(0);
++        return _diffInterp;
++    }
++    void BlendPose(float rFrac)
++    {
++        AssertBaseThis(0);
++        _pbody->BlendPoses(rFrac);
++    }
++    // For an actor whose step can't be blended because it appeared or
++    // disappeared: while the other actors are shown between movie frames,
++    // keep it as it was before the step (HoldPose), and put it right again
++    // for the new movie frame (EndHold).
++    void HoldPose(void);
++    void EndHold(void);
++    void ApplyPose(int32_t ipose)
++    {
++        AssertBaseThis(0);
++        _pbody->ApplyPose(ipose);
++    }
+     int32_t AnidCur(void)
+     {
+         AssertBaseThis(0);
+diff --git a/inc/ape.h b/inc/ape.h
+index eca3d80..041dd74 100644
+--- a/inc/ape.h
++++ b/inc/ape.h
+@@ -69,6 +69,13 @@ class APE : public APE_PAR
+     PRCA _prca;            // resource source (for cursors)
+     int32_t _ibsetOnlyAcc; // ibset of accessory, if only one (else ivNil)
+ 
++    // Frame interpolation while cycling cels.  Cels advance at kfps, but
++    // each one can be shown as _cInterp frames: the cel itself, then
++    // blended frames on the way to the next cel.
++    int32_t _cInterp;    // Frames drawn per cel; 1 or less means no interpolation
++    int32_t _isubInterp; // Next frame to show: 0 is the next cel itself, else blended
++    bool _fInterpBlend;  // The step to the next cel can be blended
++
+   protected:
+     APE(PGCB pgcb) : GOB(pgcb), _clok(CMH::HidUnique())
+     {
+@@ -77,6 +84,8 @@ class APE : public APE_PAR
+     void _InitView(void);
+     void _SetScale(void);
+     void _UpdateView(void);
++    int32_t _DtimCycleStep(void);
++    void _EndInterp(void);
+     bool _FApplyGms(GMS *pgms, int32_t ibset);
+     bool _FIncCmtl(GMS *pgms, int32_t ibset, bool fNextAccessory);
+     int32_t _CmidNext(int32_t ibset, int32_t icmidCur, bool fNextAccessory);
+diff --git a/inc/body.h b/inc/body.h
+index b6b7349..411a434 100644
+--- a/inc/body.h
++++ b/inc/body.h
+@@ -14,6 +14,29 @@
+ #ifndef BODY_H
+ #define BODY_H
+ 
++/****************************************
++    A snapshot of a BODY's pose, used for
++    frame interpolation during playback.
++    Models are AddRef'd while held.
++****************************************/
++struct BODYPOSE
++{
++    BMAT34 bmat34Root;     // root (world) matrix
++    int32_t cactHidden;    // hide count when captured
++    BMAT34 *prgbmat34Part; // one matrix per body part
++    PMODL *prgpmodlPart;   // one model per body part (AddRef'd, may be pvNil)
++    bool fValid;
++};
++
++// Result of comparing the two captured poses of a BODY
++enum
++{
++    kposeDiscontinuity = -1, // can't be blended (shape changed, shown/hidden)
++    kposeSame = 0,           // identical, nothing to blend
++    kposeDiffer = 1,         // differ and can be blended
++    kposeJump = 2            // moved too far to be a motion: stay put until the new frame
++};
++
+ /****************************************
+     The BODY class
+ ****************************************/
+@@ -42,12 +65,18 @@ class BODY : public BODY_PAR
+     RC _rcBoundsLastVis; // bounds of body last time it was visible
+     bool _fFound;        // is the actor found under the mouse?
+     int32_t _ibset;      // which body part got hit.
++    BODYPOSE _rgbpose[2]; // pose snapshots for frame interpolation (0 = from, 1 = to)
++    int32_t _cbactPosePart; // part count the pose buffers were allocated for
++    PMODL *_prgpmodlMorph;  // scratch models for blending a part's model into another (made when first needed)
+ 
+   protected:
+     BODY(void)
+     {
+     } // can't instantiate directly; must use PbodyNew
+     void _DestroyShape(void);
++    void _FreePoses(void);
++    bool _FEnsurePoseBufs(void);
++    bool _FMorphPart(int32_t ibact, PMODL pmodlFrom, PMODL pmodlTo, float rFrac);
+     bool _FInit(PGL pglibactPar, PGL pglibset);
+     bool _FInitShape(PGL pglibactPar, PGL pglibset);
+     PBACT _PbactRoot(void) // ptr to root BACT
+@@ -119,6 +148,20 @@ class BODY : public BODY_PAR
+     void GetPosition(BRS *pxr, BRS *pyr, BRS *pzr);
+     bool FPtInBody(int32_t xp, int32_t yp, int32_t *pibset);
+     bool FIsInView(void);
++
++    // Frame interpolation support.  Capture the pose into slot 0 (before a
++    // frame step) and slot 1 (after), then BlendPoses() shows any point in
++    // between and ApplyPose() restores a captured pose exactly.
++    void CapturePose(int32_t ipose);
++    int32_t DiffPoses(void);
++    void BlendPoses(float rFrac);
++    void ApplyPose(int32_t ipose);
++
++    // How far the body's origin moved between the two captured poses, and a
++    // rough size for the body in the captured pose, both in world units.
++    // Used to tell a jump from a motion.
++    float RDistPoses(void);
++    float RSizePose(int32_t ipose);
+ };
+ 
+ /****************************************
+diff --git a/inc/modl.h b/inc/modl.h
+index 12c000e..78dd06d 100644
+--- a/inc/modl.h
++++ b/inc/modl.h
+@@ -31,6 +31,30 @@ VERIFY_STRUCT_SIZE(MODLF, 48);
+ typedef MODLF *PMODLF;
+ const BOM kbomModlf = 0x55fffff0;
+ 
++/****************************************
++    What a MODL remembers of a vertex and
++    of a face of the model as it was loaded.
++    BRender prepares a model when it is
++    added, which can merge, split and
++    reorder its vertices and faces and
++    throws the original arrays away.  To
++    blend one model into another one vertex
++    for vertex (frame interpolation), these
++    are kept: see FCanBlend and FMorph.
++****************************************/
++struct MORV
++{
++    BRS rgrPos[3]; // position
++    BRS rgrMap[2]; // mapping (texture) coordinates
++};
++
++struct MORF
++{
++    uint16_t rgiv[3];   // vertices around the face
++    uint16_t grfSmooth; // smoothing groups
++    uint8_t bFlags;     // BRender face flags
++};
++
+ /****************************************
+     MODL: a wrapper for BRender models
+ ****************************************/
+@@ -45,14 +69,61 @@ class MODL : public MODL_PAR
+ 
+   protected:
+     BMDL *_pbmdl; // BRender model data
++
++    // Original vertices and faces, kept only if SetKeepOriginals(fTrue) was
++    // called before this model was loaded (else pvNil).  A model made by
++    // PmodlNewMorph has the shape it was made from here.
++    MORV *_prgmorv;
++    MORF *_prgmorf;
++    int32_t _cmorv;
++    int32_t _cmorf;
++    uint32_t _luTopo; // hash of the faces, to reject models that don't match fast
++    // Only for a morph model (see _FBuildSums / _UpdateMorphed): which faces
++    // BRender adds up for the normal of each prepared vertex, and room for
++    // the face normals
++    int32_t *_prgoSum;  // per prepared vertex (plus one): start of its faces in _prgifSum
++    uint16_t *_prgifSum; // prepared face numbers
++    uint16_t *_prgivSum; // and the (original) vertex of that face that has to be in the same place
++    MODL *_pmodlSumsFrom; // the model whose shape these lists were made for (only compared, never used)
++    float *_prgrSum;    // 3 per prepared face
++    bool _fMorph;     // made by PmodlNewMorph
++
++    static bool _fKeepOriginals;
++
+   protected:
+     MODL(void)
+     {
+     }
+     bool _FInit(PBLCK pblck);
+     bool _FPrelight(int32_t cblit, BVEC3 *prgbvec3Light);
++    void _SaveOriginals(BRV *prgbrv, int32_t cbrv, BRF *prgbrf, int32_t cbrf);
++    bool _FBuildSums(MODL *pmodlFrom);
++    void _UpdateMorphed(void);
+ 
+   public:
++    // Whether models loaded from now on keep their original vertices and
++    // faces, so that they can be blended.  Costs some memory per model.
++    static void SetKeepOriginals(bool fKeep)
++    {
++        _fKeepOriginals = fKeep;
++    }
++
++    // Frame interpolation: blending one model into another.  Two models can
++    // be blended if both kept their originals and have the same vertices
++    // joined into the same faces (they differ in where the vertices are, as
++    // in an animation where every frame is its own model).
++    bool FCanBlend(PMODL pmodlOther);
++
++    // Makes a model with the shape of pmodlFrom to be used by FMorph.  It is
++    // a scratch model: attach it to a body part instead of the real models
++    // while blending.  Returns pvNil if pmodlFrom can't be blended.
++    static PMODL PmodlNewMorph(PMODL pmodlFrom);
++
++    // Makes this (a model made by PmodlNewMorph) look like the model a
++    // fraction rFrac (0 to 1) of the way from pmodlFrom to pmodlTo, which
++    // must both satisfy FCanBlend with this model.  Returns fFalse if not.
++    bool FMorph(PMODL pmodlFrom, PMODL pmodlTo, float rFrac);
++
+     static PMODL PmodlNew(int32_t cbrv, BRV *prgbrv, int32_t cbrf, BRF *prgbrf);
+     static bool FReadModl(PCRF pcrf, CTG ctg, CNO cno, PBLCK pblck, PBACO *ppbaco, int32_t *pcb);
+     static PMODL PmodlReadFromDat(FNI *pfni);
+diff --git a/inc/movie.h b/inc/movie.h
+index 0b2ad9c..0a4ef2c 100644
+--- a/inc/movie.h
++++ b/inc/movie.h
+@@ -591,6 +591,13 @@ class MVIE : public MVIE_PAR
+ 
+     int32_t _vlmOrg; // original SNDM volume, before fadeout, if we are done with fadeout, then 0
+ 
++    // Frame interpolation (playback only).  The movie always advances at
++    // kfps, but each step can be drawn as _cInterp blended frames.
++    int32_t _cInterp;    // Frames drawn per movie frame; 1 means no interpolation
++    float _rJumpInterp;  // How far an actor can move, in its own sizes, and still be blended
++    int32_t _isubInterp; // Next in-between frame to show; 0 when none is pending
++    bool _fInterpHold;   // The current step can't be interpolated; just wait it out
++
+ #ifdef DEBUG
+     bool _fWriteBmps;
+     int32_t _lwBmp;
+@@ -600,6 +607,8 @@ class MVIE : public MVIE_PAR
+ 
+   private:
+     MVIE(void);
++    bool _FInterpTick(uint32_t tsCur); // Handles an in-between frame alarm
++    void _EndInterp(void);             // Abandons any pending in-between frames
+     PTAGL _PtaglFetch(void);                      // Returns a list of all tags used in movie
+     bool _FCloseCurrentScene(void);               // Closes and releases current scene, if any
+     bool _FMakeCrfValid(void);                    // Makes sure there is a file to work with.
+diff --git a/inc/posebld.h b/inc/posebld.h
+new file mode 100644
+index 0000000..af8ebba
+--- /dev/null
++++ b/inc/posebld.h
+@@ -0,0 +1,300 @@
++/* Copyright (c) Microsoft Corporation.
++   Licensed under the MIT License. */
++
++/***************************************************************************
++
++    posebld.h: Pose blending math for frame interpolation.
++
++    Blends two affine 3x4 matrices (BRender br_matrix34 layout, row-vector
++    convention: p' = p * M[0..2][*] + M[3][*]) by decomposing each into a
++    rotation, a lower-triangular scale/shear part and a translation.  The
++    rotations are slerped, everything else is lerped.  Decomposing instead
++    of lerping the raw matrix entries avoids the shrinking/shearing that
++    a plain matrix lerp produces in the middle of a rotation.
++
++    This header deliberately has no dependency on BRender or Kauai so the
++    math can be unit tested on its own.
++
++***************************************************************************/
++#ifndef POSEBLD_H
++#define POSEBLD_H
++
++#include <math.h>
++#include <stdint.h>
++
++namespace posebld
++{
++
++// Rows of the 3x3 part are the (scaled) basis vectors; row 3 is translation.
++typedef float Mat34[4][3];
++
++struct Decomp
++{
++    float q[4];    // unit quaternion (x, y, z, w) of the rotation
++    float u[3][3]; // lower-triangular scale/shear: row i of M = sum_{j<=i} u[i][j] * R_row_j
++    float t[3];    // translation
++    bool fMirror;  // the matrix mirrors (negative determinant)
++};
++
++namespace detail
++{
++
++inline float Dot3(const float *a, const float *b)
++{
++    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
++}
++
++inline float Len3(const float *a)
++{
++    return sqrtf(Dot3(a, a));
++}
++
++// Rotation rows -> quaternion.  rr[i] is row i of the row-vector rotation
++// matrix, which is the transpose of the usual column-vector matrix.
++inline void QuatFromRows(const float rr[3][3], float q[4])
++{
++    // Column-vector matrix c[i][j] = rr[j][i]
++    float c00 = rr[0][0], c01 = rr[1][0], c02 = rr[2][0];
++    float c10 = rr[0][1], c11 = rr[1][1], c12 = rr[2][1];
++    float c20 = rr[0][2], c21 = rr[1][2], c22 = rr[2][2];
++    float trace = c00 + c11 + c22;
++    float x, y, z, w;
++
++    if (trace > 0.0f)
++    {
++        float s = 0.5f / sqrtf(trace + 1.0f);
++        w = 0.25f / s;
++        x = (c21 - c12) * s;
++        y = (c02 - c20) * s;
++        z = (c10 - c01) * s;
++    }
++    else if (c00 > c11 && c00 > c22)
++    {
++        float s = 2.0f * sqrtf(1.0f + c00 - c11 - c22);
++        w = (c21 - c12) / s;
++        x = 0.25f * s;
++        y = (c01 + c10) / s;
++        z = (c02 + c20) / s;
++    }
++    else if (c11 > c22)
++    {
++        float s = 2.0f * sqrtf(1.0f + c11 - c00 - c22);
++        w = (c02 - c20) / s;
++        x = (c01 + c10) / s;
++        y = 0.25f * s;
++        z = (c12 + c21) / s;
++    }
++    else
++    {
++        float s = 2.0f * sqrtf(1.0f + c22 - c00 - c11);
++        w = (c10 - c01) / s;
++        x = (c02 + c20) / s;
++        y = (c12 + c21) / s;
++        z = 0.25f * s;
++    }
++
++    float n = sqrtf(x * x + y * y + z * z + w * w);
++    q[0] = x / n;
++    q[1] = y / n;
++    q[2] = z / n;
++    q[3] = w / n;
++}
++
++// Quaternion -> rotation rows (row-vector convention)
++inline void RowsFromQuat(const float q[4], float rr[3][3])
++{
++    float x = q[0], y = q[1], z = q[2], w = q[3];
++    float c[3][3];
++
++    c[0][0] = 1.0f - 2.0f * (y * y + z * z);
++    c[0][1] = 2.0f * (x * y - z * w);
++    c[0][2] = 2.0f * (x * z + y * w);
++    c[1][0] = 2.0f * (x * y + z * w);
++    c[1][1] = 1.0f - 2.0f * (x * x + z * z);
++    c[1][2] = 2.0f * (y * z - x * w);
++    c[2][0] = 2.0f * (x * z - y * w);
++    c[2][1] = 2.0f * (y * z + x * w);
++    c[2][2] = 1.0f - 2.0f * (x * x + y * y);
++
++    for (int i = 0; i < 3; i++)
++        for (int j = 0; j < 3; j++)
++            rr[j][i] = c[i][j];
++}
++
++inline void Slerp(const float a[4], const float b[4], float t, float out[4])
++{
++    float bb[4] = {b[0], b[1], b[2], b[3]};
++    float d = a[0] * bb[0] + a[1] * bb[1] + a[2] * bb[2] + a[3] * bb[3];
++
++    // Take the short way around
++    if (d < 0.0f)
++    {
++        d = -d;
++        for (int i = 0; i < 4; i++)
++            bb[i] = -bb[i];
++    }
++
++    float wa, wb;
++    if (d > 0.9995f)
++    {
++        // Nearly parallel: normalized lerp is accurate and avoids dividing by ~0
++        wa = 1.0f - t;
++        wb = t;
++    }
++    else
++    {
++        float theta = acosf(d);
++        float sinTheta = sinf(theta);
++        wa = sinf((1.0f - t) * theta) / sinTheta;
++        wb = sinf(t * theta) / sinTheta;
++    }
++
++    float n = 0.0f;
++    for (int i = 0; i < 4; i++)
++    {
++        out[i] = wa * a[i] + wb * bb[i];
++        n += out[i] * out[i];
++    }
++    n = sqrtf(n);
++    for (int i = 0; i < 4; i++)
++        out[i] /= n;
++}
++
++} // namespace detail
++
++/***************************************************************************
++    Decompose m into rotation * scale/shear + translation.  Returns false if
++    the matrix is (nearly) singular, in which case there is no meaningful
++    way to blend it.
++***************************************************************************/
++inline bool FDecompose(const Mat34 m, Decomp *pd)
++{
++    const float kEps = 1e-6f;
++    float r[3][3];
++    float v[3];
++    int i, j;
++
++    // Gram-Schmidt on the rows
++    float n0 = detail::Len3(m[0]);
++    if (n0 < kEps)
++        return false;
++    for (j = 0; j < 3; j++)
++        r[0][j] = m[0][j] / n0;
++
++    float d10 = detail::Dot3(m[1], r[0]);
++    for (j = 0; j < 3; j++)
++        v[j] = m[1][j] - d10 * r[0][j];
++    float n1 = detail::Len3(v);
++    if (n1 < kEps)
++        return false;
++    for (j = 0; j < 3; j++)
++        r[1][j] = v[j] / n1;
++
++    float d20 = detail::Dot3(m[2], r[0]);
++    float d21 = detail::Dot3(m[2], r[1]);
++    for (j = 0; j < 3; j++)
++        v[j] = m[2][j] - d20 * r[0][j] - d21 * r[1][j];
++    float n2 = detail::Len3(v);
++    if (n2 < kEps)
++        return false;
++    for (j = 0; j < 3; j++)
++        r[2][j] = v[j] / n2;
++
++    // Make sure R is a proper rotation.  A reflection ends up as a negative
++    // u[2][2] instead.
++    float det = r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1]) - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0]) +
++                r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0]);
++    pd->fMirror = (det < 0.0f);
++    if (pd->fMirror)
++    {
++        for (j = 0; j < 3; j++)
++            r[2][j] = -r[2][j];
++    }
++
++    for (i = 0; i < 3; i++)
++        for (j = 0; j < 3; j++)
++            pd->u[i][j] = (j <= i) ? detail::Dot3(m[i], r[j]) : 0.0f;
++
++    detail::QuatFromRows(r, pd->q);
++    for (j = 0; j < 3; j++)
++        pd->t[j] = m[3][j];
++    return true;
++}
++
++inline void Compose(const Decomp &d, Mat34 m)
++{
++    float r[3][3];
++    detail::RowsFromQuat(d.q, r);
++
++    for (int i = 0; i < 3; i++)
++    {
++        for (int k = 0; k < 3; k++)
++        {
++            float s = 0.0f;
++            for (int j = 0; j <= i; j++)
++                s += d.u[i][j] * r[j][k];
++            m[i][k] = s;
++        }
++    }
++    for (int k = 0; k < 3; k++)
++        m[3][k] = d.t[k];
++}
++
++/***************************************************************************
++    Blend a -> b at fraction t in [0, 1].  Returns false if either matrix
++    can't be decomposed, or if one mirrors and the other doesn't (blending
++    those would pass through a flattened, zero-determinant matrix).  The
++    caller should fall back to showing one of the endpoints in that case.
++***************************************************************************/
++inline bool FBlend(const Mat34 a, const Mat34 b, float t, Mat34 out)
++{
++    Decomp da, db, d;
++
++    if (!FDecompose(a, &da) || !FDecompose(b, &db) || da.fMirror != db.fMirror)
++        return false;
++
++    detail::Slerp(da.q, db.q, t, d.q);
++    for (int i = 0; i < 3; i++)
++    {
++        for (int j = 0; j < 3; j++)
++            d.u[i][j] = da.u[i][j] + (db.u[i][j] - da.u[i][j]) * t;
++        d.t[i] = da.t[i] + (db.t[i] - da.t[i]) * t;
++    }
++    Compose(d, out);
++    return true;
++}
++
++/***************************************************************************
++    Timing for splitting one movie frame of dtimFrame clock ticks into cSub
++    slices.  Each slice boundary is rounded to a whole tick on its own, so
++    the slices always add up to exactly one frame and none is longer than
++    one tick more than its share.  (cSub can't exceed dtimFrame: a slice
++    can't be shorter than one tick.)
++***************************************************************************/
++inline int32_t DtimSliceOffset(int32_t isub, int32_t cSub, int32_t dtimFrame)
++{
++    return (isub * dtimFrame + cSub / 2) / cSub;
++}
++inline int32_t DtimSlice(int32_t isub, int32_t cSub, int32_t dtimFrame)
++{
++    return DtimSliceOffset(isub + 1, cSub, dtimFrame) - DtimSliceOffset(isub, cSub, dtimFrame);
++}
++
++/***************************************************************************
++    Did an actor jump rather than move?  rDist is how far its origin moved in
++    one movie frame, rStep how far walking its route can carry it in a frame,
++    rSize roughly how big the actor is, and rLimit how many actor sizes of
++    movement beyond the step still count as a motion (0 turns jump detection
++    off).  Walking never moves an actor more than rStep, so a move well past
++    that is a teleport, a Move or Tweak event, or a new subroute.
++***************************************************************************/
++inline bool FIsJump(float rDist, float rStep, float rSize, float rLimit)
++{
++    if (!(rLimit > 0.0f))
++        return false;
++    return rDist > 1.5f * rStep + rLimit * rSize;
++}
++
++} // namespace posebld
++
++#endif // POSEBLD_H
+diff --git a/inc/scene.h b/inc/scene.h
+index 012c4e8..15248cc 100644
+--- a/inc/scene.h
++++ b/inc/scene.h
+@@ -220,6 +220,15 @@ class SCEN : public SCEN_PAR
+     }
+     bool FReplayFrm(uint32_t grfscen); // Replay events in this scene.
+ 
++    // Frame interpolation during playback.  Capture the actors' poses before
++    // (slot 0) and after (slot 1) stepping a frame; DiffPoses() says whether
++    // the step is smooth enough to blend; BlendPoses() shows a point between
++    // the two and ApplyPoses() restores one exactly.
++    void CapturePoses(int32_t ipose, float rJumpLimit = 0.0f);
++    int32_t DiffPoses(void);
++    void BlendPoses(float rFrac);
++    void ApplyPoses(int32_t ipose);
++
+     //
+     // Undo accessor functions
+     //
+diff --git a/inc/socdef.h b/inc/socdef.h
+index 393fddc..3492f32 100644
+--- a/inc/socdef.h
++++ b/inc/socdef.h
+@@ -176,6 +176,8 @@
+ // Feature flags
+ #define kpridHighQualitySoundImport 0x23700
+ #define kpridStereoSoundPlayback 0x23701
++#define kpridFrameInterpolation 0x23702
++#define kpridFrameInterpolationJump 0x23703
+ #define kpridFeatureFlagLim 0x23800
+ 
+ #endif // SOCDEF_H
+diff --git a/inc/utest.h b/inc/utest.h
+index 720bbd4..c437c18 100644
+--- a/inc/utest.h
++++ b/inc/utest.h
+@@ -74,6 +74,28 @@ class KWA : public KWA_PAR
+ #define kszStereoSound PszLit("StereoSound")
+ #define kszStereoSoundDefault fFalse
+ 
++// Number of frames to draw for each movie frame during playback.  Movies
++// always advance at 6 frames per second; values above 1 smooth the motion
++// by drawing blended frames in between (4 = 24 fps, 5 = 30 fps, 10 = 60 fps).
++// 1 turns it off.  Values above 10 are treated as 10.
++#define kszFrameInterpolation PszLit("FrameInterpolation")
++#define klwFrameInterpolationDefault 1
++
++// How far, in percent of an actor's own size, it can move in one movie frame
++// beyond what walking its route explains and still be smoothed.  Anything
++// farther (a teleport, a Move or Tweak) waits at its old position until the
++// movie frame changes instead of sliding across.  0 smooths everything.
++#define kszFrameInterpolationJump PszLit("FrameInterpolationJump")
++#define klwFrameInterpolationJumpDefault 50
++
++// Whether the blended frames also blend the shape of models that animate by
++// swapping between models with the same faces (many add-on actors and props,
++// and the Explosion).  0 leaves those at the movie's own 6 frames per second,
++// which costs less to draw and less memory.  Only used if FrameInterpolation
++// is above 1, and only read when the program starts.
++#define kszFrameInterpolationVertex PszLit("FrameInterpolationVertex")
++#define klwFrameInterpolationVertexDefault 1
++
+ // FGetSetRegKey flags
+ enum
+ {
+diff --git a/src/engine/actor.cpp b/src/engine/actor.cpp
+index 633f318..4979164 100644
+--- a/src/engine/actor.cpp
++++ b/src/engine/actor.cpp
+@@ -110,6 +110,7 @@
+ ***************************************************************************/
+ #include "frame.h"
+ #include "soc.h"
++#include "posebld.h"
+ 
+ ASSERTNAME
+ 
+@@ -176,6 +177,122 @@ bool ACTR::_FInit(TAG *ptagTmpl)
+     return fTrue;
+ }
+ 
++/***************************************************************************
++
++    Frame interpolation support.  Captures the pose of this actor's body into
++    slot ipose (0 = before a frame step, 1 = after), along with the actor
++    state needed to tell a motion from a jump.
++
++    Capturing slot 1 also decides how the step will be shown (see DiffPoses
++    in actor.h), because that needs both poses and the step distance and
++    never changes until the next step:
++
++      kposeDiscontinuity  the actor appeared, disappeared or changed shape;
++                          the whole step can't be blended
++      kposeSame           nothing moved
++      kposeDiffer         a motion; blend it
++      kposeJump           it moved much farther than walking its route
++                          explains (a new subroute, a Move or Tweak event),
++                          so it should stay where it was until the new frame
++
++    rJumpLimit is how far, in multiples of the actor's own size, it may
++    move beyond its step distance and still count as a motion.  0 means
++    never call anything a jump.
++
++***************************************************************************/
++void ACTR::CapturePose(int32_t ipose, float rJumpLimit)
++{
++    AssertThis(0);
++    AssertIn(ipose, 0, 2);
++
++    _rgiaevAddInterp[ipose] = _iaevAddCur;
++    _rgfOnStageInterp[ipose] = FPure(_fOnStage);
++    _pbody->CapturePose(ipose);
++
++    if (ipose == 0)
++    {
++        // Not a complete step until slot 1 is captured
++        _diffInterp = kposeDiscontinuity;
++        return;
++    }
++
++    if (_rgfOnStageInterp[0] != _rgfOnStageInterp[1])
++    {
++        _diffInterp = kposeDiscontinuity;
++        return;
++    }
++
++    _diffInterp = _pbody->DiffPoses();
++    if (_diffInterp != kposeDiffer)
++        return;
++
++    // A new subroute while on stage is how teleporting is recorded
++    if (_rgiaevAddInterp[0] != _rgiaevAddInterp[1])
++    {
++        _diffInterp = kposeJump;
++        return;
++    }
++
++    // Walking the route moves the actor at most one step, so a move well
++    // beyond that (allowing some room for small nudges) was a jump.
++    if (rJumpLimit > 0.0f &&
++        posebld::FIsJump(_pbody->RDistPoses(), BrScalarToFloat(_dwrLastStep), _pbody->RSizePose(0), rJumpLimit))
++    {
++        _diffInterp = kposeJump;
++    }
++}
++
++/***************************************************************************
++
++    Frame interpolation: keeps an actor whose step can't be blended (it
++    appeared or disappeared) as it was before the step, while the rest of the
++    scene is shown between movie frames.  An actor that appeared stays hidden
++    until the new movie frame, one that disappeared stays where it was until
++    then.  Does nothing for other kinds of step.  EndHold undoes this.
++
++***************************************************************************/
++void ACTR::HoldPose(void)
++{
++    AssertThis(0);
++
++    if (_diffInterp != kposeDiscontinuity || _imaskInterp != kimaskNone || _pbody == pvNil)
++        return;
++
++    if (!_rgfOnStageInterp[0] && _rgfOnStageInterp[1] && _fOnStage)
++    {
++        _pbody->Hide(); // not here yet
++        _imaskInterp = kimaskHidden;
++    }
++    else if (_rgfOnStageInterp[0] && !_rgfOnStageInterp[1] && !_fOnStage)
++    {
++        _pbody->ApplyPose(0); // still here
++        _pbody->Show();
++        _imaskInterp = kimaskShown;
++    }
++}
++
++/***************************************************************************
++
++    Frame interpolation: undoes HoldPose, so the actor is as the new movie
++    frame has it.
++
++***************************************************************************/
++void ACTR::EndHold(void)
++{
++    AssertThis(0);
++
++    if (_imaskInterp == kimaskHidden)
++    {
++        _pbody->Show();
++    }
++    else if (_imaskInterp == kimaskShown)
++    {
++        _pbody->ApplyPose(1);
++        _pbody->Hide();
++    }
++    _imaskInterp = kimaskNone;
++}
++
+ /***************************************************************************
+ 
+     Initialize the transformation matrix & factors
+@@ -657,6 +774,7 @@ bool ACTR::_FDoFrm(bool fPositionBody, bool *pfPositionDirty, bool *pfSoundInFra
+     // Obtain distance to move.	This may be shortened on encountering
+     // a aetActn event later in this same frame.
+     fSuccess = _FGetDwrPlay(&dwr);
++    _dwrLastStep = dwr; // for frame interpolation: how far walking could move us
+     _AdvanceRtel(dwr, &_rtelCur, _iaevCur, _nfrmCur, &fEndRoute);
+     _GetXyzFromRtel(&_rtelCur, &_xyzCur);
+ 
+diff --git a/src/engine/body.cpp b/src/engine/body.cpp
+index 52431b4..6fa01ac 100644
+--- a/src/engine/body.cpp
++++ b/src/engine/body.cpp
+@@ -112,6 +112,7 @@
+ 
+ ***************************************************************************/
+ #include "soc.h"
++#include "posebld.h"
+ ASSERTNAME
+ 
+ RTCLASS(BODY)
+@@ -462,6 +463,9 @@ void BODY::_DestroyShape(void)
+     if (_cactHidden == 0)
+         Hide();
+ 
++    // Pose snapshots hold model references and are sized by the part count
++    _FreePoses();
++
+     if (pvNil != _prgbact)
+     {
+         for (ibact = 0; ibact < _cbactPart; ibact++)
+@@ -1132,6 +1136,406 @@ bool BODY::FIsInView(void)
+     return !_rcBounds.FEmpty();
+ }
+ 
++/***************************************************************************
++    Frame interpolation support.
++
++    During playback the movie advances at a fixed rate, but the view can be
++    drawn more often.  The caller captures the pose before a frame step
++    (slot 0) and after it (slot 1), then calls BlendPoses() to show points
++    in between.  ApplyPose() puts a captured pose back exactly, which the
++    caller must do before the next frame step because the actor code only
++    rewrites a matrix when it thinks that matrix changed.
++***************************************************************************/
++
++// Blends two BRender matrices.  Returns fFalse if they can't be blended.
++static bool _FBlendBmat34(const BMAT34 *pbmat34A, const BMAT34 *pbmat34B, float rFrac, BMAT34 *pbmat34Out)
++{
++    posebld::Mat34 a, b, o;
++    int32_t i, j;
++
++    for (i = 0; i < 4; i++)
++    {
++        for (j = 0; j < 3; j++)
++        {
++            a[i][j] = BrScalarToFloat(pbmat34A->m[i][j]);
++            b[i][j] = BrScalarToFloat(pbmat34B->m[i][j]);
++        }
++    }
++    if (!posebld::FBlend(a, b, rFrac, o))
++        return fFalse;
++    for (i = 0; i < 4; i++)
++    {
++        for (j = 0; j < 3; j++)
++            pbmat34Out->m[i][j] = BrFloatToScalar(o[i][j]);
++    }
++    return fTrue;
++}
++
++/***************************************************************************
++    Releases the pose snapshots and their model references
++***************************************************************************/
++void BODY::_FreePoses(void)
++{
++    AssertBaseThis(0);
++
++    int32_t ipose;
++    int32_t ibact;
++    BODYPOSE *ppose;
++
++    for (ipose = 0; ipose < 2; ipose++)
++    {
++        ppose = &_rgbpose[ipose];
++        if (pvNil != ppose->prgpmodlPart)
++        {
++            for (ibact = 0; ibact < _cbactPosePart; ibact++)
++                ReleasePpo(&ppose->prgpmodlPart[ibact]);
++            FreePpv((void **)&ppose->prgpmodlPart);
++        }
++        FreePpv((void **)&ppose->prgbmat34Part);
++        ppose->fValid = fFalse;
++    }
++    // A part may still be showing one of the scratch models; it holds its own
++    // reference, so releasing ours is safe.
++    if (pvNil != _prgpmodlMorph)
++    {
++        for (ibact = 0; ibact < _cbactPosePart; ibact++)
++            ReleasePpo(&_prgpmodlMorph[ibact]);
++        FreePpv((void **)&_prgpmodlMorph);
++    }
++    _cbactPosePart = 0;
++}
++
++/***************************************************************************
++    Makes sure the pose buffers exist and match the current part count
++***************************************************************************/
++bool BODY::_FEnsurePoseBufs(void)
++{
++    AssertBaseThis(0);
++
++    int32_t ipose;
++    BODYPOSE *ppose;
++
++    if (_cbactPosePart == _cbactPart && pvNil != _rgbpose[0].prgbmat34Part)
++        return fTrue;
++
++    _FreePoses();
++    if (_cbactPart <= 0)
++        return fFalse;
++
++    for (ipose = 0; ipose < 2; ipose++)
++    {
++        ppose = &_rgbpose[ipose];
++        if (!FAllocPv((void **)&ppose->prgbmat34Part, LwMul(_cbactPart, SIZEOF(BMAT34)), fmemClear, mprNormal) ||
++            !FAllocPv((void **)&ppose->prgpmodlPart, LwMul(_cbactPart, SIZEOF(PMODL)), fmemClear, mprNormal))
++        {
++            _FreePoses();
++            return fFalse;
++        }
++    }
++    // Only needed (and only filled in) for parts whose model changes
++    if (!FAllocPv((void **)&_prgpmodlMorph, LwMul(_cbactPart, SIZEOF(PMODL)), fmemClear, mprNormal))
++    {
++        _FreePoses();
++        return fFalse;
++    }
++    _cbactPosePart = _cbactPart;
++    return fTrue;
++}
++
++/***************************************************************************
++    Captures the current pose into slot ipose (0 or 1)
++***************************************************************************/
++void BODY::CapturePose(int32_t ipose)
++{
++    AssertThis(0);
++    AssertIn(ipose, 0, 2);
++
++    BODYPOSE *ppose = &_rgbpose[ipose];
++    int32_t ibact;
++    PBACT pbact;
++    PMODL pmodl;
++
++    if (!_FEnsurePoseBufs())
++    {
++        // Out of memory.  An invalid pose makes the step non-blendable.
++        _rgbpose[ipose].fValid = fFalse;
++        return;
++    }
++
++    ppose = &_rgbpose[ipose];
++    ppose->bmat34Root = _PbactRoot()->t.t.mat;
++    ppose->cactHidden = _cactHidden;
++    for (ibact = 0; ibact < _cbactPart; ibact++)
++    {
++        pbact = _PbactPart(ibact);
++        ppose->prgbmat34Part[ibact] = pbact->t.t.mat;
++
++        // Take the new reference before dropping the old one in case they match
++        pmodl = pvNil;
++        if (pvNil != pbact->model)
++        {
++            pmodl = MODL::PmodlFromBmdl(pbact->model);
++            pmodl->AddRef();
++        }
++        ReleasePpo(&ppose->prgpmodlPart[ibact]);
++        ppose->prgpmodlPart[ibact] = pmodl;
++    }
++    ppose->fValid = fTrue;
++}
++
++/***************************************************************************
++    Compares the two captured poses.  Returns kposeDiscontinuity if they
++    can't be blended, kposeSame if there's nothing to blend, else
++    kposeDiffer.
++***************************************************************************/
++int32_t BODY::DiffPoses(void)
++{
++    AssertThis(0);
++
++    BODYPOSE *ppose0 = &_rgbpose[0];
++    BODYPOSE *ppose1 = &_rgbpose[1];
++    int32_t ibact;
++
++    if (!ppose0->fValid || !ppose1->fValid || _cbactPosePart != _cbactPart)
++        return kposeDiscontinuity;
++
++    // Shown or hidden during the step: that's an appearance, not a motion
++    if (ppose0->cactHidden != ppose1->cactHidden)
++        return kposeDiscontinuity;
++
++    // Hidden for the whole step: nothing to see
++    if (ppose0->cactHidden != 0)
++        return kposeSame;
++
++    if (0 != memcmp(&ppose0->bmat34Root, &ppose1->bmat34Root, SIZEOF(BMAT34)))
++        return kposeDiffer;
++    for (ibact = 0; ibact < _cbactPart; ibact++)
++    {
++        if (ppose0->prgpmodlPart[ibact] != ppose1->prgpmodlPart[ibact])
++            return kposeDiffer;
++        if (0 != memcmp(&ppose0->prgbmat34Part[ibact], &ppose1->prgbmat34Part[ibact], SIZEOF(BMAT34)))
++            return kposeDiffer;
++    }
++    return kposeSame;
++}
++
++/***************************************************************************
++    Shows the pose a fraction rFrac (0 to 1) of the way from slot 0 to
++    slot 1.  Matrices are blended.  Models can't be, so each part uses its
++    slot 0 model for the first half and its slot 1 model for the rest.
++***************************************************************************/
++void BODY::BlendPoses(float rFrac)
++{
++    AssertThis(0);
++    Assert(rFrac >= 0.0f && rFrac <= 1.0f, "bad blend fraction");
++
++    BODYPOSE *ppose0 = &_rgbpose[0];
++    BODYPOSE *ppose1 = &_rgbpose[1];
++    int32_t ibact;
++    PBACT pbact;
++    PMODL pmodl;
++
++    if (!ppose0->fValid || !ppose1->fValid || _cbactPosePart != _cbactPart || _cactHidden != 0)
++        return;
++
++    if (!_FBlendBmat34(&ppose0->bmat34Root, &ppose1->bmat34Root, rFrac, &_PbactRoot()->t.t.mat))
++        _PbactRoot()->t.t.mat = (rFrac < 0.5f) ? ppose0->bmat34Root : ppose1->bmat34Root;
++
++    for (ibact = 0; ibact < _cbactPart; ibact++)
++    {
++        pbact = _PbactPart(ibact);
++
++        if (!_FBlendBmat34(&ppose0->prgbmat34Part[ibact], &ppose1->prgbmat34Part[ibact], rFrac, &pbact->t.t.mat))
++        {
++            pbact->t.t.mat = (rFrac < 0.5f) ? ppose0->prgbmat34Part[ibact] : ppose1->prgbmat34Part[ibact];
++        }
++
++        if (pvNil != ppose0->prgpmodlPart[ibact] && pvNil != ppose1->prgpmodlPart[ibact] &&
++            ppose0->prgpmodlPart[ibact] != ppose1->prgpmodlPart[ibact] &&
++            _FMorphPart(ibact, ppose0->prgpmodlPart[ibact], ppose1->prgpmodlPart[ibact], rFrac))
++        {
++            continue; // the part now has the blended model
++        }
++
++        // The model doesn't change, or can't be blended: switch at the midpoint
++        pmodl = (rFrac < 0.5f) ? ppose0->prgpmodlPart[ibact] : ppose1->prgpmodlPart[ibact];
++        if (pvNil != pmodl)
++            SetPartModel(ibact, pmodl); // does nothing if it's already the part's model
++    }
++
++    AssertPo(_pbwld, 0);
++    _pbwld->MarkDirty(); // need to render
++}
++
++/***************************************************************************
++    Gives part ibact a model that is a fraction rFrac of the way from
++    pmodlFrom to pmodlTo (vertex for vertex, for parts that are animated by
++    swapping between models with the same faces).  Returns fFalse, leaving
++    the part alone, if the two models can't be blended.
++***************************************************************************/
++bool BODY::_FMorphPart(int32_t ibact, PMODL pmodlFrom, PMODL pmodlTo, float rFrac)
++{
++    AssertThis(0);
++    AssertIn(ibact, 0, _cbactPart);
++    AssertPo(pmodlFrom, 0);
++    AssertPo(pmodlTo, 0);
++
++    PMODL pmodlMorph;
++
++    if (pvNil == _prgpmodlMorph || _cbactPosePart != _cbactPart)
++        return fFalse;
++    if (!pmodlFrom->FCanBlend(pmodlTo))
++        return fFalse;
++
++    pmodlMorph = _prgpmodlMorph[ibact];
++    if (pvNil == pmodlMorph || !pmodlMorph->FMorph(pmodlFrom, pmodlTo, rFrac))
++    {
++        // No scratch model yet, or it was made for other faces
++        ReleasePpo(&_prgpmodlMorph[ibact]);
++        pmodlMorph = MODL::PmodlNewMorph(pmodlFrom);
++        if (pvNil == pmodlMorph)
++            return fFalse;
++        _prgpmodlMorph[ibact] = pmodlMorph;
++        if (!pmodlMorph->FMorph(pmodlFrom, pmodlTo, rFrac))
++            return fFalse;
++    }
++
++    SetPartModel(ibact, pmodlMorph);
++    return fTrue;
++}
++
++/***************************************************************************
++    Puts the pose captured in slot ipose back exactly
++***************************************************************************/
++void BODY::ApplyPose(int32_t ipose)
++{
++    AssertThis(0);
++    AssertIn(ipose, 0, 2);
++
++    BODYPOSE *ppose = &_rgbpose[ipose];
++    int32_t ibact;
++    PBACT pbact;
++
++    if (!ppose->fValid || _cbactPosePart != _cbactPart)
++        return;
++
++    _PbactRoot()->t.t.mat = ppose->bmat34Root;
++    for (ibact = 0; ibact < _cbactPart; ibact++)
++    {
++        pbact = _PbactPart(ibact);
++        pbact->t.t.mat = ppose->prgbmat34Part[ibact];
++        if (pvNil != ppose->prgpmodlPart[ibact])
++            SetPartModel(ibact, ppose->prgpmodlPart[ibact]);
++    }
++
++    if (_cactHidden == 0)
++    {
++        AssertPo(_pbwld, 0);
++        _pbwld->MarkDirty(); // need to render
++    }
++}
++
++/***************************************************************************
++    How far the body's origin moved between the two captured poses, in
++    world units.  Returns 0 if either pose is missing.
++***************************************************************************/
++float BODY::RDistPoses(void)
++{
++    AssertThis(0);
++
++    BODYPOSE *ppose0 = &_rgbpose[0];
++    BODYPOSE *ppose1 = &_rgbpose[1];
++    float rDelta;
++    float rSumSq = 0.0f;
++    int32_t j;
++
++    if (!ppose0->fValid || !ppose1->fValid)
++        return 0.0f;
++
++    for (j = 0; j < 3; j++)
++    {
++        rDelta = BrScalarToFloat(ppose1->bmat34Root.m[3][j]) - BrScalarToFloat(ppose0->bmat34Root.m[3][j]);
++        rSumSq += rDelta * rDelta;
++    }
++    return sqrtf(rSumSq);
++}
++
++/***************************************************************************
++    A rough size for the body in the pose captured in slot ipose, in world
++    units: the farthest any part gets from the body's origin, counting the
++    part's own model radius, times the body's overall scale.  The distance
++    to a part is the sum of its offsets up the chain of parents, which can
++    only overestimate it.  This only has to be good to within a factor of
++    two or so.  Returns 0 if the pose is missing.
++***************************************************************************/
++float BODY::RSizePose(int32_t ipose)
++{
++    AssertThis(0);
++    AssertIn(ipose, 0, 2);
++
++    BODYPOSE *ppose = &_rgbpose[ipose];
++    float rMax = 0.0f;
++    float rScale = 0.0f;
++    int32_t ibact;
++    int32_t ibactUp;
++    int32_t cDepth;
++    int32_t i, j;
++
++    if (!ppose->fValid || _cbactPosePart != _cbactPart)
++        return 0.0f;
++
++    // Overall scale: the longest basis vector of the root matrix
++    for (i = 0; i < 3; i++)
++    {
++        float rSumSq = 0.0f;
++        for (j = 0; j < 3; j++)
++        {
++            float r = BrScalarToFloat(ppose->bmat34Root.m[i][j]);
++            rSumSq += r * r;
++        }
++        if (rSumSq > rScale)
++            rScale = rSumSq;
++    }
++    rScale = sqrtf(rScale);
++
++    for (ibact = 0; ibact < _cbactPart; ibact++)
++    {
++        float rReach = 0.0f;
++        float rRadius = 0.0f;
++        PBACT pbact = _PbactPart(ibact);
++
++        // Walk up through the parents to the root (or hilite) BACT.  The
++        // depth limit guards against a corrupt tree.
++        ibactUp = ibact;
++        for (cDepth = 0; cDepth <= _cbactPart; cDepth++)
++        {
++            float rSumSq = 0.0f;
++
++            for (j = 0; j < 3; j++)
++            {
++                float r = BrScalarToFloat(ppose->prgbmat34Part[ibactUp].m[3][j]);
++                rSumSq += r * r;
++            }
++            rReach += sqrtf(rSumSq);
++
++            pbact = _PbactPart(ibactUp)->parent;
++            if (pvNil == pbact)
++                break;
++            ibactUp = (int32_t)(pbact - _prgbact) - 2; // parts start after root and hilite
++            if (ibactUp < 0 || ibactUp >= _cbactPart)
++                break;
++        }
++
++        if (pvNil != ppose->prgpmodlPart[ibact])
++            rRadius = BrScalarToFloat(ppose->prgpmodlPart[ibact]->Pbmdl()->radius);
++
++        if (rReach + rRadius > rMax)
++            rMax = rReach + rRadius;
++    }
++
++    return rMax * rScale;
++}
++
+ /***************************************************************************
+     Fills in the 2D bounds of the BODY, the last time it was rendered.  If
+     the BODY was not in view at the last render, this function fills in the
+@@ -1243,6 +1647,33 @@ void BODY::MarkMem(void)
+     MarkPv(_prgpcmtl);
+     MarkMemObj(_pglibset);
+ 
++    if (pvNil != _prgpmodlMorph)
++    {
++        MarkPv(_prgpmodlMorph);
++        for (ibact = 0; ibact < _cbactPosePart; ibact++)
++        {
++            if (pvNil != _prgpmodlMorph[ibact])
++                MarkMemObj(_prgpmodlMorph[ibact]);
++        }
++    }
++
++    for (int32_t ipose = 0; ipose < 2; ipose++)
++    {
++        BODYPOSE *ppose = &_rgbpose[ipose];
++
++        if (pvNil != ppose->prgbmat34Part)
++            MarkPv(ppose->prgbmat34Part);
++        if (pvNil != ppose->prgpmodlPart)
++        {
++            MarkPv(ppose->prgpmodlPart);
++            for (ibact = 0; ibact < _cbactPosePart; ibact++)
++            {
++                if (pvNil != ppose->prgpmodlPart[ibact])
++                    MarkMemObj(ppose->prgpmodlPart[ibact]);
++            }
++        }
++    }
++
+     for (ibact = 0; ibact < _cbactPart; ibact++)
+     {
+         pbact = _PbactPart(ibact);
+diff --git a/src/engine/modl.cpp b/src/engine/modl.cpp
+index 9dfd27f..0b09633 100644
+--- a/src/engine/modl.cpp
++++ b/src/engine/modl.cpp
+@@ -14,6 +14,8 @@ ASSERTNAME
+ 
+ RTCLASS(MODL)
+ 
++bool MODL::_fKeepOriginals = fFalse;
++
+ /***************************************************************************
+     Create a new PMODL based on some vertices and faces.
+ ***************************************************************************/
+@@ -209,6 +211,10 @@ bool MODL::_FInit(PBLCK pblck)
+         if (!DeserializeBMDL(modlf.bo, _pbmdl))
+             return fFalse;
+ 
++        // BrModelAdd throws the original vertices and faces away
++        if (_fKeepOriginals)
++            _SaveOriginals(_pbmdl->vertices, modlf.cver, _pbmdl->faces, modlf.cfac);
++
+         BrModelAdd(_pbmdl);
+ 
+         // REVIEW *****: uncomment and expand the following code to prelight models
+@@ -269,11 +275,531 @@ bool MODL::_FInit(PBLCK pblck)
+         _pbmdl->radius = modlf.rRadius;
+         _pbmdl->bounds = modlf.brb;
+         _pbmdl->pivot = modlf.bvec3Pivot;
++        // A prepared model has no originals, but if its prepared vertices
++        // and faces match another one's exactly (FCanBlend checks), they can
++        // be blended just as well.
++        if (_fKeepOriginals)
++            _SaveOriginals(_pbmdl->prepared_vertices, modlf.cver, _pbmdl->prepared_faces, modlf.cfac);
+         BrModelAdd(_pbmdl);
+     }
+     return fTrue;
+ }
+ 
++/***************************************************************************
++    Remembers the vertices and faces a model is made of (see FCanBlend).
++    If this runs out of memory the model just can't be blended.
++***************************************************************************/
++void MODL::_SaveOriginals(BRV *prgbrv, int32_t cbrv, BRF *prgbrf, int32_t cbrf)
++{
++    AssertBaseThis(0);
++    int32_t i, j;
++    uint32_t luHash = 2166136261U;
++
++    if (cbrv <= 0 || cbrf <= 0 || cbrv > ksuMax || cbrf > ksuMax)
++        return;
++    if (!FAllocPv((void **)&_prgmorv, LwMul(cbrv, SIZEOF(MORV)), fmemClear, mprNormal))
++        return;
++    if (!FAllocPv((void **)&_prgmorf, LwMul(cbrf, SIZEOF(MORF)), fmemClear, mprNormal))
++    {
++        FreePpv((void **)&_prgmorv);
++        return;
++    }
++    _cmorv = cbrv;
++    _cmorf = cbrf;
++
++    for (i = 0; i < cbrv; i++)
++    {
++        for (j = 0; j < 3; j++)
++            _prgmorv[i].rgrPos[j] = prgbrv[i].p.v[j];
++        for (j = 0; j < 2; j++)
++            _prgmorv[i].rgrMap[j] = prgbrv[i].map.v[j];
++    }
++    for (i = 0; i < cbrf; i++)
++    {
++        for (j = 0; j < 3; j++)
++        {
++            _prgmorf[i].rgiv[j] = prgbrf[i].vertices[j];
++            luHash = (luHash ^ prgbrf[i].vertices[j]) * 16777619U;
++        }
++        _prgmorf[i].grfSmooth = prgbrf[i].smoothing;
++        _prgmorf[i].bFlags = prgbrf[i].flags;
++        luHash = (luHash ^ prgbrf[i].smoothing) * 16777619U;
++        luHash = (luHash ^ prgbrf[i].flags) * 16777619U;
++    }
++    _luTopo = luHash ^ (uint32_t)cbrv ^ ((uint32_t)cbrf << 16);
++}
++
++/***************************************************************************
++    Can this model be blended with pmodlOther, vertex for vertex?  Both have
++    to have kept their originals and have the same faces joining the same
++    vertices; where the vertices are and their mapping coordinates may differ.
++***************************************************************************/
++bool MODL::FCanBlend(PMODL pmodlOther)
++{
++    AssertThis(0);
++    AssertPo(pmodlOther, 0);
++    int32_t imorf;
++    MORF *pmorfThis, *pmorfOther;
++
++    if (pvNil == _prgmorv || pvNil == pmodlOther->_prgmorv)
++        return fFalse;
++    if (pmodlOther == this)
++        return fTrue;
++    if (_cmorv != pmodlOther->_cmorv || _cmorf != pmodlOther->_cmorf || _luTopo != pmodlOther->_luTopo)
++        return fFalse;
++
++    // The hash is only a quick check: indexing past the vertices would
++    // be bad, so make sure
++    for (imorf = 0, pmorfThis = _prgmorf, pmorfOther = pmodlOther->_prgmorf; imorf < _cmorf;
++         imorf++, pmorfThis++, pmorfOther++)
++    {
++        if (pmorfThis->rgiv[0] != pmorfOther->rgiv[0] || pmorfThis->rgiv[1] != pmorfOther->rgiv[1] ||
++            pmorfThis->rgiv[2] != pmorfOther->rgiv[2] || pmorfThis->grfSmooth != pmorfOther->grfSmooth ||
++            pmorfThis->bFlags != pmorfOther->bFlags)
++        {
++            return fFalse;
++        }
++    }
++    return fTrue;
++}
++
++/***************************************************************************
++    Makes a scratch model with the vertices and faces of pmodlFrom, to be
++    given the shape of a blend with FMorph.  Unlike the models loaded from
++    files it keeps its originals so it can be updated again and again.
++***************************************************************************/
++PMODL MODL::PmodlNewMorph(PMODL pmodlFrom)
++{
++    AssertPo(pmodlFrom, 0);
++    PMODL pmodl;
++    char szIdentifier[SIZEOF(PMODL) + 1];
++    int32_t i, j;
++    BRV *pbrv;
++    BRF *pbrf;
++
++    if (pvNil == pmodlFrom->_prgmorv)
++        return pvNil;
++
++    pmodl = NewObj MODL;
++    if (pvNil == pmodl)
++        return pvNil;
++
++    // BrModelAllocate copies the name, and a name that ends at the first zero
++    // wouldn't leave room for the pointer
++    FillPb(szIdentifier, SIZEOF(PMODL), 'M');
++    szIdentifier[SIZEOF(PMODL)] = 0;
++    pmodl->_pbmdl = BrModelAllocate(szIdentifier, pmodlFrom->_cmorv, pmodlFrom->_cmorf);
++    if (pvNil == pmodl->_pbmdl)
++        goto LFail;
++    CopyPb(&pmodl, pmodl->_pbmdl->identifier, SIZEOF(PMODL));
++
++    ClearPb(pmodl->_pbmdl->vertices, LwMul(pmodlFrom->_cmorv, SIZEOF(BRV)));
++    ClearPb(pmodl->_pbmdl->faces, LwMul(pmodlFrom->_cmorf, SIZEOF(BRF)));
++    for (i = 0, pbrv = pmodl->_pbmdl->vertices; i < pmodlFrom->_cmorv; i++, pbrv++)
++    {
++        for (j = 0; j < 3; j++)
++            pbrv->p.v[j] = pmodlFrom->_prgmorv[i].rgrPos[j];
++        for (j = 0; j < 2; j++)
++            pbrv->map.v[j] = pmodlFrom->_prgmorv[i].rgrMap[j];
++    }
++    for (i = 0, pbrf = pmodl->_pbmdl->faces; i < pmodlFrom->_cmorf; i++, pbrf++)
++    {
++        for (j = 0; j < 3; j++)
++            pbrf->vertices[j] = pmodlFrom->_prgmorf[i].rgiv[j];
++        pbrf->material = pvNil;
++        pbrf->smoothing = pmodlFrom->_prgmorf[i].grfSmooth;
++        pbrf->flags = pmodlFrom->_prgmorf[i].bFlags;
++    }
++
++    // Don't weld vertices that happen to be in the same place in one frame
++    // and not in another, and keep the vertices and faces for the next update.
++    // The tags say which original vertex each prepared vertex came from, which
++    // is what lets _UpdateMorphed skip the preparing.
++    pmodl->_pbmdl->flags |= BR_MODF_DONT_WELD | BR_MODF_KEEP_ORIGINAL | BR_MODF_GENERATE_TAGS;
++    pmodl->_fMorph = fTrue;
++
++    // Remember what it was made from, so FMorph can tell whether the models
++    // it is asked to blend still have its vertices and faces.
++    if (!FAllocPv((void **)&pmodl->_prgmorv, LwMul(pmodlFrom->_cmorv, SIZEOF(MORV)), fmemClear, mprNormal))
++        goto LFail;
++    CopyPb(pmodlFrom->_prgmorv, pmodl->_prgmorv, LwMul(pmodlFrom->_cmorv, SIZEOF(MORV)));
++    if (!FAllocPv((void **)&pmodl->_prgmorf, LwMul(pmodlFrom->_cmorf, SIZEOF(MORF)), fmemClear, mprNormal))
++        goto LFail;
++    CopyPb(pmodlFrom->_prgmorf, pmodl->_prgmorf, LwMul(pmodlFrom->_cmorf, SIZEOF(MORF)));
++    pmodl->_cmorv = pmodlFrom->_cmorv;
++    pmodl->_cmorf = pmodlFrom->_cmorf;
++    pmodl->_luTopo = pmodlFrom->_luTopo;
++
++    BrModelAdd(pmodl->_pbmdl);
++
++    // If any of this can't be had, FMorph still works, only slower
++    if (FAllocPv((void **)&pmodl->_prgrSum, LwMul(3 * pmodlFrom->_cmorf, SIZEOF(float)), fmemClear, mprNormal))
++        pmodl->_FBuildSums(pmodlFrom);
++    AssertPo(pmodl, 0);
++    return pmodl;
++LFail:
++    ReleasePpo(&pmodl);
++    return pvNil;
++}
++
++/***************************************************************************
++    Gives this model (made by PmodlNewMorph) the shape that is a fraction
++    rFrac of the way from the vertices of pmodlFrom to those of pmodlTo.
++***************************************************************************/
++bool MODL::FMorph(PMODL pmodlFrom, PMODL pmodlTo, float rFrac)
++{
++    AssertThis(0);
++    AssertPo(pmodlFrom, 0);
++    AssertPo(pmodlTo, 0);
++    int32_t i, j;
++    BRV *pbrv;
++    MORV *pmorvFrom, *pmorvTo;
++    float rFrom, rTo;
++
++    // This model has to still have the vertices and faces of pmodlFrom (and
++    // so of pmodlTo), else it would be drawn with the wrong faces
++    if (!_fMorph || !FCanBlend(pmodlFrom) || !pmodlFrom->FCanBlend(pmodlTo) || _pbmdl->nvertices != _cmorv ||
++        _pbmdl->nfaces != _cmorf)
++    {
++        return fFalse;
++    }
++
++    if (rFrac < 0.0f)
++        rFrac = 0.0f;
++    else if (rFrac > 1.0f)
++        rFrac = 1.0f;
++
++    for (i = 0, pbrv = _pbmdl->vertices, pmorvFrom = pmodlFrom->_prgmorv, pmorvTo = pmodlTo->_prgmorv;
++         i < pmodlFrom->_cmorv; i++, pbrv++, pmorvFrom++, pmorvTo++)
++    {
++        for (j = 0; j < 3; j++)
++        {
++            rFrom = BrScalarToFloat(pmorvFrom->rgrPos[j]);
++            rTo = BrScalarToFloat(pmorvTo->rgrPos[j]);
++            pbrv->p.v[j] = BrFloatToScalar(rFrom + (rTo - rFrom) * rFrac);
++        }
++        for (j = 0; j < 2; j++)
++        {
++            rFrom = BrScalarToFloat(pmorvFrom->rgrMap[j]);
++            rTo = BrScalarToFloat(pmorvTo->rgrMap[j]);
++            pbrv->map.v[j] = BrFloatToScalar(rFrom + (rTo - rFrom) * rFrac);
++        }
++    }
++
++    // The faces that smooth together depend on which vertices are in the same
++    // place, which is worked out for the frame this blend starts from
++    if (_pmodlSumsFrom != pmodlFrom)
++        _FBuildSums(pmodlFrom);
++
++    _UpdateMorphed();
++    return fTrue;
++}
++
++struct MORP // a vertex of the original model, to find the ones in the same place
++{
++    BRS rgrPos[3];
++    int32_t iv;
++};
++
++static int _CompareMorp(const void *pv1, const void *pv2)
++{
++    const MORP *pmorp1 = (const MORP *)pv1;
++    const MORP *pmorp2 = (const MORP *)pv2;
++
++    for (int32_t i = 0; i < 3; i++)
++    {
++        if (pmorp1->rgrPos[i] != pmorp2->rgrPos[i])
++            return (pmorp1->rgrPos[i] > pmorp2->rgrPos[i]) ? 1 : -1;
++    }
++    return (pmorp1->iv > pmorp2->iv) - (pmorp1->iv < pmorp2->iv);
++}
++
++/***************************************************************************
++    Works out, once, which faces BRender adds up to get the normal of each
++    prepared vertex, so that _UpdateMorphed can do the same without sorting
++    anything.  BRender adds the normals of the faces that touch the vertex
++    or any other vertex in the same place, as long as the two faces share a
++    smoothing group.  Vertices are in the same place or not depending on the
++    shape, so this is made for the shape of pmodlFrom: the lists have all the
++    faces that could count, and _UpdateMorphed checks that the vertices are
++    still together in the shape it is drawing.
++***************************************************************************/
++bool MODL::_FBuildSums(MODL *pmodlFrom)
++{
++    AssertBaseThis(0);
++    BMDL *pbmdl = _pbmdl;
++    BRF *prgbrf = pbmdl->faces;
++    int32_t cf = pbmdl->nfaces;
++    int32_t cvOrig = pbmdl->nvertices;
++    int32_t cvPrep = pbmdl->nprepared_vertices;
++    int32_t cc = 3 * cf; // corners
++    MORP *prgmorp = pvNil;
++    int32_t *prggid = pvNil;   // group (same place) of each original vertex
++    int32_t *prgoGroup = pvNil; // where each group's corners start in prgcGroup
++    int32_t *prgcGroup = pvNil; // corners (3 * face + vertex), by group
++    int32_t *prgnFill = pvNil;  // fill position for each group
++    int32_t *prgifPrep = pvNil; // prepared face of each face
++    int32_t *prgcFirst = pvNil; // first corner that uses each prepared vertex
++    int32_t *prgoSum = pvNil;
++    uint16_t *prgifSum = pvNil;
++    uint16_t *prgivSum = pvNil;
++    int32_t cGroup = 0;
++    int32_t i, c, e, k, g, ipv, n;
++    bool fRet = fFalse;
++
++    _pmodlSumsFrom = pmodlFrom;
++    FreePpv((void **)&_prgoSum); // until there are new ones, _UpdateMorphed does it the slow way
++    FreePpv((void **)&_prgifSum);
++    FreePpv((void **)&_prgivSum);
++    if (pvNil == pmodlFrom->_prgmorv || pmodlFrom->_cmorv != cvOrig || pmodlFrom->_cmorf != cf)
++        return fFalse;
++    if (pvNil == pbmdl->face_tags || pvNil == prgbrf || cf <= 0 || cvOrig <= 0 || cvPrep <= 0 || cf > ksuMax ||
++        pbmdl->nprepared_faces != cf)
++    {
++        return fFalse;
++    }
++    if (!FAllocPv((void **)&prgmorp, LwMul(cvOrig, SIZEOF(MORP)), fmemClear, mprNormal) ||
++        !FAllocPv((void **)&prggid, LwMul(cvOrig, SIZEOF(int32_t)), fmemClear, mprNormal) ||
++        !FAllocPv((void **)&prgoGroup, LwMul(cvOrig + 1, SIZEOF(int32_t)), fmemClear, mprNormal) ||
++        !FAllocPv((void **)&prgnFill, LwMul(cvOrig + 1, SIZEOF(int32_t)), fmemClear, mprNormal) ||
++        !FAllocPv((void **)&prgcGroup, LwMul(cc, SIZEOF(int32_t)), fmemClear, mprNormal) ||
++        !FAllocPv((void **)&prgifPrep, LwMul(cf, SIZEOF(int32_t)), fmemClear, mprNormal) ||
++        !FAllocPv((void **)&prgcFirst, LwMul(cvPrep, SIZEOF(int32_t)), fmemClear, mprNormal) ||
++        !FAllocPv((void **)&prgoSum, LwMul(cvPrep + 1, SIZEOF(int32_t)), fmemClear, mprNormal))
++    {
++        goto LDone;
++    }
++
++    // Vertices in the same place share a group
++    for (i = 0; i < cvOrig; i++)
++    {
++        for (k = 0; k < 3; k++)
++            prgmorp[i].rgrPos[k] = pmodlFrom->_prgmorv[i].rgrPos[k];
++        prgmorp[i].iv = i;
++    }
++    qsort(prgmorp, cvOrig, SIZEOF(MORP), _CompareMorp);
++    for (i = 0; i < cvOrig; i++)
++    {
++        if (i > 0 && 0 != memcmp(prgmorp[i].rgrPos, prgmorp[i - 1].rgrPos, SIZEOF(prgmorp[i].rgrPos)))
++            cGroup++;
++        prggid[prgmorp[i].iv] = cGroup;
++    }
++    cGroup++;
++
++    // The corners of the faces, by group
++    for (c = 0; c < cc; c++)
++    {
++        if (prgbrf[c / 3].vertices[c % 3] >= cvOrig)
++            goto LDone;
++        prgoGroup[prggid[prgbrf[c / 3].vertices[c % 3]] + 1]++;
++    }
++    for (g = 0; g < cGroup; g++)
++        prgoGroup[g + 1] += prgoGroup[g];
++    for (c = 0; c < cc; c++)
++    {
++        g = prggid[prgbrf[c / 3].vertices[c % 3]];
++        prgcGroup[prgoGroup[g] + prgnFill[g]++] = c;
++    }
++
++    // Prepared face of each face, prepared vertex of each corner
++    for (i = 0; i < cf; i++)
++        prgifPrep[i] = -1;
++    for (i = 0; i < cf; i++)
++    {
++        if (pbmdl->face_tags[i] >= cf)
++            goto LDone;
++        prgifPrep[pbmdl->face_tags[i]] = i;
++    }
++    for (i = 0; i < cf; i++)
++    {
++        if (prgifPrep[i] < 0)
++            goto LDone;
++    }
++    for (i = 0; i < cvPrep; i++)
++        prgcFirst[i] = -1;
++    for (c = 0; c < cc; c++)
++    {
++        ipv = pbmdl->prepared_faces[prgifPrep[c / 3]].vertices[c % 3];
++        if (ipv >= cvPrep)
++            goto LDone;
++        if (prgcFirst[ipv] < 0)
++            prgcFirst[ipv] = c;
++    }
++
++    // Count, then fill in, the faces of each prepared vertex (those of the
++    // first corner that uses it: the others it was merged with have the same)
++    for (i = 0; i < cvPrep; i++)
++    {
++        c = prgcFirst[i];
++        if (c < 0)
++            goto LDone;
++        g = prggid[prgbrf[c / 3].vertices[c % 3]];
++        n = 0;
++        for (k = prgoGroup[g]; k < prgoGroup[g + 1]; k++)
++        {
++            if (prgbrf[prgcGroup[k] / 3].smoothing & prgbrf[c / 3].smoothing)
++                n++;
++        }
++        prgoSum[i + 1] = prgoSum[i] + n;
++    }
++    if (!FAllocPv((void **)&prgifSum, LwMul(prgoSum[cvPrep] > 0 ? prgoSum[cvPrep] : 1, SIZEOF(uint16_t)), fmemClear,
++                  mprNormal) ||
++        !FAllocPv((void **)&prgivSum, LwMul(prgoSum[cvPrep] > 0 ? prgoSum[cvPrep] : 1, SIZEOF(uint16_t)), fmemClear,
++                  mprNormal))
++    {
++        goto LDone;
++    }
++    for (i = 0; i < cvPrep; i++)
++    {
++        c = prgcFirst[i];
++        g = prggid[prgbrf[c / 3].vertices[c % 3]];
++        n = prgoSum[i];
++        for (k = prgoGroup[g]; k < prgoGroup[g + 1]; k++)
++        {
++            e = prgcGroup[k];
++            if (prgbrf[e / 3].smoothing & prgbrf[c / 3].smoothing)
++            {
++                prgivSum[n] = prgbrf[e / 3].vertices[e % 3];
++                prgifSum[n++] = (uint16_t)prgifPrep[e / 3];
++            }
++        }
++    }
++
++    _prgoSum = prgoSum;
++    _prgifSum = prgifSum;
++    _prgivSum = prgivSum;
++    prgoSum = pvNil;
++    prgifSum = pvNil;
++    prgivSum = pvNil;
++    fRet = fTrue;
++
++LDone:
++    FreePpv((void **)&prgmorp);
++    FreePpv((void **)&prggid);
++    FreePpv((void **)&prgoGroup);
++    FreePpv((void **)&prgnFill);
++    FreePpv((void **)&prgcGroup);
++    FreePpv((void **)&prgifPrep);
++    FreePpv((void **)&prgcFirst);
++    FreePpv((void **)&prgoSum);
++    FreePpv((void **)&prgifSum);
++    FreePpv((void **)&prgivSum);
++    return fRet;
++}
++
++/***************************************************************************
++    Brings the prepared vertices and faces of a morph model up to date with
++    its (just changed) original vertices.  BrModelUpdate(BR_MODU_ALL) would
++    sort and weld everything again, which costs far too much to do for every
++    frame that's drawn.  The faces and which vertex is which don't change
++    from one blend to the next, so only positions, mapping coordinates and
++    normals are redone, the way BRender's own normals-only update does it
++    (but that one leaves the last face out of the vertex normals).
++***************************************************************************/
++void MODL::_UpdateMorphed(void)
++{
++    AssertBaseThis(0);
++    BMDL *pbmdl = _pbmdl;
++    int32_t iv, ibrf, cv, j;
++    BRV *pbrv;
++    BRF *pbrf;
++    float *prgrSum;
++
++    cv = pbmdl->nprepared_vertices;
++    if (pvNil == pbmdl->vertex_tags || pvNil == pbmdl->prepared_vertices || pvNil == pbmdl->prepared_faces ||
++        pbmdl->nprepared_faces != pbmdl->nfaces || cv <= 0 || pvNil == _prgoSum || pvNil == _prgifSum ||
++        pvNil == _prgivSum || pvNil == _prgrSum)
++    {
++        BrModelUpdate(pbmdl, BR_MODU_ALL); // no way to tell which vertex is which: do it all
++        return;
++    }
++    prgrSum = _prgrSum;
++
++    // Positions and mapping coordinates
++    for (iv = 0, pbrv = pbmdl->prepared_vertices; iv < cv; iv++, pbrv++)
++    {
++        BRV *pbrvOrig = &pbmdl->vertices[pbmdl->vertex_tags[iv]];
++        pbrv->p = pbrvOrig->p;
++        pbrv->map = pbrvOrig->map;
++    }
++
++    // Face normals and plane equations (the same arithmetic as BRender's)
++    for (ibrf = 0, pbrf = pbmdl->prepared_faces; ibrf < pbmdl->nprepared_faces; ibrf++, pbrf++)
++    {
++        BRV *pbrv0 = &pbmdl->prepared_vertices[pbrf->vertices[0]];
++        BRV *pbrv1 = &pbmdl->prepared_vertices[pbrf->vertices[1]];
++        BRV *pbrv2 = &pbmdl->prepared_vertices[pbrf->vertices[2]];
++        float rax = BrScalarToFloat(pbrv1->p.v[0] - pbrv0->p.v[0]);
++        float ray = BrScalarToFloat(pbrv1->p.v[1] - pbrv0->p.v[1]);
++        float raz = BrScalarToFloat(pbrv1->p.v[2] - pbrv0->p.v[2]);
++        float rbx = BrScalarToFloat(pbrv2->p.v[0] - pbrv0->p.v[0]);
++        float rby = BrScalarToFloat(pbrv2->p.v[1] - pbrv0->p.v[1]);
++        float rbz = BrScalarToFloat(pbrv2->p.v[2] - pbrv0->p.v[2]);
++        float rnx = ray * rbz - raz * rby;
++        float rny = raz * rbx - rax * rbz;
++        float rnz = rax * rby - ray * rbx;
++        float rl = sqrtf(rnx * rnx + rny * rny + rnz * rnz);
++
++        if (rl != 0.0f)
++        {
++            rnx /= rl;
++            rny /= rl;
++            rnz /= rl;
++        }
++        else
++        {
++            rnx = 0.0f;
++            rny = 0.0f;
++            rnz = 1.0f;
++        }
++        pbrf->n.v[0] = BR_FRACTION(rnx);
++        pbrf->n.v[1] = BR_FRACTION(rny);
++        pbrf->n.v[2] = BR_FRACTION(rnz);
++        pbrf->d = BrFloatToScalar(rnx * BrScalarToFloat(pbrv0->p.v[0]) + rny * BrScalarToFloat(pbrv0->p.v[1]) +
++                                  rnz * BrScalarToFloat(pbrv0->p.v[2]));
++        prgrSum[3 * ibrf] = rnx;
++        prgrSum[3 * ibrf + 1] = rny;
++        prgrSum[3 * ibrf + 2] = rnz;
++    }
++
++    // Vertex normals: add up the faces BRender does (see _FBuildSums)
++    for (iv = 0, pbrv = pbmdl->prepared_vertices; iv < cv; iv++, pbrv++)
++    {
++        float rx = 0.0f, ry = 0.0f, rz = 0.0f, rl;
++        BRS *prgrHere = pbmdl->vertices[pbmdl->vertex_tags[iv]].p.v;
++
++        for (j = _prgoSum[iv]; j < _prgoSum[iv + 1]; j++)
++        {
++            // Only the faces at vertices that are (still) in the same place
++            BRS *prgrThere = pbmdl->vertices[_prgivSum[j]].p.v;
++            if (prgrThere[0] != prgrHere[0] || prgrThere[1] != prgrHere[1] || prgrThere[2] != prgrHere[2])
++                continue;
++            rx += prgrSum[3 * _prgifSum[j]];
++            ry += prgrSum[3 * _prgifSum[j] + 1];
++            rz += prgrSum[3 * _prgifSum[j] + 2];
++        }
++        rl = sqrtf(rx * rx + ry * ry + rz * rz);
++        if (rl != 0.0f)
++        {
++            rx /= rl;
++            ry /= rl;
++            rz /= rl;
++        }
++        else
++        {
++            rx = 0.0f;
++            ry = 0.0f;
++            rz = 1.0f;
++        }
++        pbrv->n.v[0] = BR_FRACTION(rx);
++        pbrv->n.v[1] = BR_FRACTION(ry);
++        pbrv->n.v[2] = BR_FRACTION(rz);
++    }
++
++    // Bounding radius and box (from the originals; cheap)
++    BrModelUpdate(pbmdl, BR_MODU_RADIUS | BR_MODU_BOUNDING_BOX);
++}
++
+ /***************************************************************************
+     Reads a BRender model from a .DAT file
+ ***************************************************************************/
+@@ -326,6 +852,12 @@ MODL::~MODL(void)
+         BrModelRemove(_pbmdl);
+         BrModelFree(_pbmdl);
+     }
++    FreePpv((void **)&_prgmorv);
++    FreePpv((void **)&_prgmorf);
++    FreePpv((void **)&_prgrSum);
++    FreePpv((void **)&_prgoSum);
++    FreePpv((void **)&_prgifSum);
++    FreePpv((void **)&_prgivSum);
+ }
+ 
+ /***************************************************************************
+@@ -508,5 +1040,11 @@ void MODL::MarkMem(void)
+     AssertThis(0);
+ 
+     MODL_PAR::MarkMem();
++    MarkPv(_prgmorv);
++    MarkPv(_prgmorf);
++    MarkPv(_prgrSum);
++    MarkPv(_prgoSum);
++    MarkPv(_prgifSum);
++    MarkPv(_prgivSum);
+ }
+ #endif // DEBUG
+diff --git a/src/engine/movie.cpp b/src/engine/movie.cpp
+index c32f676..f313890 100644
+--- a/src/engine/movie.cpp
++++ b/src/engine/movie.cpp
+@@ -27,6 +27,7 @@ Actors, Text boxes, etc.
+ ***************************************************************************/
+ 
+ #include "soc.h"
++#include "posebld.h"
+ ASSERTNAME
+ 
+ #define krScaleMouseRecord BR_SCALAR(0.20)
+@@ -40,6 +41,20 @@ ASSERTNAME
+ #define kdtimVlmFade (kdtimSecond / 4)  // number of clock ticks necessary to split 1 sec into 4 events
+ #define kzrMouseScalingFactor BR_SCALAR(100.0)
+ 
++// Frame interpolation timing.  A movie frame lasts kdtimFrame clock ticks and
++// is split into cInterp slices.  Each slice boundary is rounded to a whole
++// tick on its own, so the slices always add up to exactly one frame.  (This
++// is also why cInterp can't exceed kdtimFrame: a slice can't be shorter than
++// one clock tick.)
++static int32_t _DtimInterpOffset(int32_t isub, int32_t cInterp)
++{
++    return posebld::DtimSliceOffset(isub, cInterp, kdtimFrame);
++}
++static int32_t _DtimInterp(int32_t isub, int32_t cInterp)
++{
++    return posebld::DtimSlice(isub, cInterp, kdtimFrame);
++}
++
+ const CHID kchidGstSource = 1;
+ 
+ //
+@@ -4130,6 +4145,17 @@ void MVIE::Play()
+         SetFSoundsEnabled(fTrue);
+         _cnfrm = 0;
+         _tsStart = TsCurrent();
++
++        // Frame interpolation: draw several blended frames per movie frame
++        int32_t lwInterp;
++        _cInterp = 1;
++        _isubInterp = 0;
++        _fInterpHold = fFalse;
++        if (vpappb->FGetProp(kpridFrameInterpolation, &lwInterp))
++            _cInterp = LwMax(1, LwMin(lwInterp, kdtimFrame));
++        _rJumpInterp = 0.5f;
++        if (vpappb->FGetProp(kpridFrameInterpolationJump, &lwInterp))
++            _rJumpInterp = (float)LwMax(0, lwInterp) / 100.0f;
+         SetFStopPlaying(fFalse);
+         _clok.Start(0);
+         SetFPlaying(fTrue);
+@@ -4234,6 +4260,7 @@ bool MVIE::FCmdAlarm(PCMD pcmd)
+             //
+             // Things are in a bad way.
+             //
++            _EndInterp();
+             Pmcc()->EnableAccel();
+             SetFPlaying(fFalse);
+             SetFStopPlaying(fFalse);
+@@ -4298,6 +4325,12 @@ bool MVIE::FCmdRender(PCMD pcmd)
+     PTBOX ptbox;
+     int32_t itbox;
+     uint32_t tsCur = TsCurrent();
++    bool fInterpStep;       // Is this step being split into blended frames?
++    int32_t dtimFirst;      // Clock ticks until the first alarm after this step
++    BMAT34 bmat34CamBefore; // Camera before and after a step, to spot cuts
++    BMAT34 bmat34CamAfter;
++    BRS zrHitherBefore, zrYonBefore, zrHitherAfter, zrYonAfter;
++    BRA aFovBefore, aFovAfter;
+ 
+     pmvu = (PMVU)PddgGet(0);
+     AssertPo(pmvu, 0);
+@@ -4306,6 +4339,9 @@ bool MVIE::FCmdRender(PCMD pcmd)
+     {
+     LStopPlaying:
+ 
++        // If we were between blended frames, put the actors back exactly
++        _EndInterp();
++
+         Pmcc()->EnableAccel();
+         _clok.Stop();
+         _clok.RemoveCmh(this);
+@@ -4354,6 +4390,19 @@ bool MVIE::FCmdRender(PCMD pcmd)
+         return (fTrue);
+     }
+ 
++    //
++    // An alarm between two movie frames: show the next blended frame
++    // instead of running a movie frame.
++    //
++    if (_isubInterp > 0)
++    {
++        if (!_FInterpTick(tsCur))
++        {
++            goto LStopPlaying;
++        }
++        return (fTrue);
++    }
++
+     //
+     // if _vlmOrg is nonzero, then we are in the process of fading
+     //
+@@ -4551,7 +4600,14 @@ bool MVIE::FCmdRender(PCMD pcmd)
+     //     Account for time spent between beginning of this routine and
+     //     here.
+     //
+-    if (!_clok.FSetAlarm(LwMax(0, kdtimFrame - LwMulDivAway((TsCurrent() - tsCur), kdtimSecond, kdtsSecond)), this, 0,
++    // With frame interpolation on, a normal step (one that isn't the end of
++    // the scene) is shown as _cInterp blended frames, so the first alarm is
++    // only one slice away.  If it turns out the step can't be blended, the
++    // alarm handler just waits out the rest of the frame.
++    //
++    fInterpStep = (_cInterp > 1) && (Pscen()->Nfrm() != Pscen()->NfrmLast());
++    dtimFirst = fInterpStep ? _DtimInterp(0, _cInterp) : kdtimFrame;
++    if (!_clok.FSetAlarm(LwMax(0, dtimFirst - LwMulDivAway((TsCurrent() - tsCur), kdtimSecond, kdtsSecond)), this, 0,
+                          fTrue))
+     {
+         goto LStopPlaying;
+@@ -4602,12 +4658,37 @@ bool MVIE::FCmdRender(PCMD pcmd)
+     }
+     else
+     {
++        if (fInterpStep)
++        {
++            // Remember where everything is before the step
++            Pscen()->CapturePoses(0);
++            Pbwld()->GetCamera(&bmat34CamBefore, &zrHitherBefore, &zrYonBefore, &aFovBefore);
++        }
+ 
+         if (!Pscen()->FGotoFrm(Pscen()->Nfrm() + 1))
+         {
+             SetFStopPlaying(fTrue);
+             return (fTrue);
+         }
++
++        if (fInterpStep)
++        {
++            // ...and after it, then decide whether the step is smooth.  It
++            // isn't if the camera cut, if an actor appeared, disappeared or
++            // jumped, or if nothing moved at all (nothing to blend).
++            Pscen()->CapturePoses(1, _rJumpInterp);
++            Pbwld()->GetCamera(&bmat34CamAfter, &zrHitherAfter, &zrYonAfter, &aFovAfter);
++
++            _fInterpHold = (0 != memcmp(&bmat34CamBefore, &bmat34CamAfter, SIZEOF(BMAT34)) ||
++                            zrHitherBefore != zrHitherAfter || zrYonBefore != zrYonAfter || aFovBefore != aFovAfter ||
++                            kposeDiffer != Pscen()->DiffPoses());
++            if (!_fInterpHold)
++            {
++                // Get the first blended frame ready.  The next alarm shows it.
++                Pscen()->BlendPoses(1.0f / _cInterp);
++            }
++            _isubInterp = 1;
++        }
+     }
+ 
+     Pbwld()->Render();
+@@ -4616,6 +4697,79 @@ bool MVIE::FCmdRender(PCMD pcmd)
+     return (fTrue);
+ }
+ 
++/***************************************************************************
++ *
++ * Handles an alarm between two movie frames, when frame interpolation is
++ * on.  The world has already been rendered with the blended frame that is
++ * due now, so show it, then get the next one ready.  After the last blended
++ * frame the actors are put back at their exact new positions, so the next
++ * movie frame starts from (and shows) exactly what the movie says.
++ *
++ * Parameters:
++ *	tsCur - Time this alarm began being handled.
++ *
++ * Returns:
++ *  fFalse if the next alarm couldn't be set (stop playing), else fTrue.
++ *
++ ***************************************************************************/
++bool MVIE::_FInterpTick(uint32_t tsCur)
++{
++    AssertThis(0);
++    Assert(_isubInterp > 0 && _isubInterp < _cInterp, "no blended frame pending");
++
++    int32_t isub = _isubInterp;
++    int32_t dtim;
++
++    if (_fInterpHold)
++    {
++        // This step couldn't be blended, and the new frame is already
++        // rendered.  Just wait out the rest of the movie frame.
++        _fInterpHold = fFalse;
++        _isubInterp = 0;
++        dtim = kdtimFrame - _DtimInterpOffset(isub, _cInterp);
++    }
++    else
++    {
++        // Show the blended frame for slice isub
++        MarkViews();
++        vpappb->UpdateMarked();
++
++        if (isub + 1 < _cInterp)
++        {
++            Pscen()->BlendPoses((float)(isub + 1) / (float)_cInterp);
++            _isubInterp = isub + 1;
++        }
++        else
++        {
++            Pscen()->ApplyPoses(1);
++            _isubInterp = 0;
++        }
++        Pbwld()->Render();
++        dtim = _DtimInterp(isub, _cInterp);
++    }
++
++    return _clok.FSetAlarm(LwMax(0, dtim - LwMulDivAway((TsCurrent() - tsCur), kdtimSecond, kdtsSecond)), this, 0,
++                           fTrue);
++}
++
++/***************************************************************************
++ *
++ * Abandons any pending blended frames, because playback is stopping.  The
++ * actors have already been advanced to the new movie frame, so they just
++ * need to be put back exactly where the movie says they are.
++ *
++ ***************************************************************************/
++void MVIE::_EndInterp(void)
++{
++    AssertThis(0);
++
++    if (_isubInterp > 0 && !_fInterpHold && Pscen() != pvNil)
++        Pscen()->ApplyPoses(1);
++
++    _isubInterp = 0;
++    _fInterpHold = fFalse;
++}
++
+ /***************************************************************************
+  *
+  * This sets the costume of an actor.
+diff --git a/src/engine/scene.cpp b/src/engine/scene.cpp
+index 70ad438..3ee19ae 100644
+--- a/src/engine/scene.cpp
++++ b/src/engine/scene.cpp
+@@ -5169,6 +5169,127 @@ bool SCEN::_FForceActorsToFrm(int32_t nfrm, bool *pfSoundInFrame)
+     return (fTrue);
+ }
+ 
++/****************************************************
++ *
++ * Frame interpolation: captures every actor's pose into slot ipose.
++ * Capturing slot 1 also classifies each actor's step (see ACTR::CapturePose).
++ *
++ * Parameters:
++ *  ipose - 0 before stepping a frame, 1 after.
++ *  rJumpLimit - How far an actor may move, in multiples of its own size
++ *      beyond its step distance, before it counts as having jumped.
++ *      0 means never.
++ *
++ ****************************************************/
++void SCEN::CapturePoses(int32_t ipose, float rJumpLimit)
++{
++    AssertThis(0);
++    AssertIn(ipose, 0, 2);
++
++    PACTR pactr;
++    int32_t iactr;
++
++    for (iactr = 0; iactr < _pglpactr->IvMac(); iactr++)
++    {
++        _pglpactr->Get(iactr, &pactr);
++        AssertPo(pactr, 0);
++        pactr->CapturePose(ipose, rJumpLimit);
++    }
++}
++
++/****************************************************
++ *
++ * Frame interpolation: decides whether the step between the poses captured
++ * in slots 0 and 1 can be shown as blended frames.
++ *
++ * Returns:
++ *  kposeDiffer if at least one actor moved smoothly (blend it; actors that
++ *      jumped, appeared, disappeared or changed shape are held as they were
++ *      until the new frame, the rest don't move),
++ *  kposeSame if there is nothing to blend (and so the step is just shown at
++ *      the new frame).
++ *
++ ****************************************************/
++int32_t SCEN::DiffPoses(void)
++{
++    AssertThis(0);
++
++    PACTR pactr;
++    int32_t iactr;
++    int32_t diff;
++    int32_t diffScene = kposeSame;
++
++    for (iactr = 0; iactr < _pglpactr->IvMac(); iactr++)
++    {
++        _pglpactr->Get(iactr, &pactr);
++        AssertPo(pactr, 0);
++        diff = pactr->DiffPoses();
++        if (diff == kposeDiffer)
++            diffScene = kposeDiffer;
++    }
++    return diffScene;
++}
++
++/****************************************************
++ *
++ * Frame interpolation: puts every moving actor a fraction rFrac (0 to 1)
++ * of the way from its slot 0 pose to its slot 1 pose.  Actors that jumped
++ * are kept at their slot 0 pose, so they pop to the new place when the
++ * movie frame changes, not early; actors that appeared or disappeared are
++ * kept hidden or visible until then too.  Actors that didn't move are left
++ * alone so they don't need re-rendering.
++ *
++ ****************************************************/
++void SCEN::BlendPoses(float rFrac)
++{
++    AssertThis(0);
++
++    PACTR pactr;
++    int32_t iactr;
++    int32_t diff;
++
++    for (iactr = 0; iactr < _pglpactr->IvMac(); iactr++)
++    {
++        _pglpactr->Get(iactr, &pactr);
++        AssertPo(pactr, 0);
++        diff = pactr->DiffPoses();
++        if (diff == kposeDiffer)
++            pactr->BlendPose(rFrac);
++        else if (diff == kposeJump)
++            pactr->ApplyPose(0);
++        else if (diff == kposeDiscontinuity)
++            pactr->HoldPose();
++    }
++}
++
++/****************************************************
++ *
++ * Frame interpolation: restores every moving or jumping actor to the pose
++ * captured in slot ipose exactly, and lets actors held back by BlendPoses
++ * appear or disappear.  Callers must do this (with slot 1) before the next
++ * frame step.
++ *
++ ****************************************************/
++void SCEN::ApplyPoses(int32_t ipose)
++{
++    AssertThis(0);
++    AssertIn(ipose, 0, 2);
++
++    PACTR pactr;
++    int32_t iactr;
++    int32_t diff;
++
++    for (iactr = 0; iactr < _pglpactr->IvMac(); iactr++)
++    {
++        _pglpactr->Get(iactr, &pactr);
++        AssertPo(pactr, 0);
++        diff = pactr->DiffPoses();
++        if (diff == kposeDiffer || diff == kposeJump)
++            pactr->ApplyPose(ipose);
++        pactr->EndHold(); // does nothing unless BlendPoses held this actor back
++    }
++}
++
+ /****************************************************
+  *
+  * This routine makes all text boxes go to a specific frame.
+diff --git a/src/studio/ape.cpp b/src/studio/ape.cpp
+index fdabfaa..2164555 100644
+--- a/src/studio/ape.cpp
++++ b/src/studio/ape.cpp
+@@ -22,6 +22,7 @@
+ 
+ ***************************************************************************/
+ #include "studio.h"
++#include "posebld.h"
+ ASSERTNAME
+ 
+ #define kdtimFrame (kdtimSecond / kfps) // clock ticks per frame
+@@ -112,6 +113,12 @@ bool APE::_FInit(PTMPL ptmpl, PCOST pcost, int32_t anid, bool fCycleCels, PRCA p
+     for (ibset = 0; ibset < cbset; ibset++)
+         _pglgms->Put(ibset, &gms);
+ 
++    // Frame interpolation uses the same setting as movie playback
++    int32_t lwInterp;
++    _cInterp = 1;
++    if (vpappb->FGetProp(kpridFrameInterpolation, &lwInterp))
++        _cInterp = LwMax(1, LwMin(lwInterp, kdtimFrame));
++
+     GetRc(&rc, cooLocal);
+     _pbwld = BWLD::PbwldNew(rc.Dxp(), rc.Dyp());
+     if (pvNil == _pbwld)
+@@ -226,6 +233,7 @@ bool APE::FSetAction(int32_t anid)
+ {
+     AssertThis(0);
+ 
++    _isubInterp = 0; // blended frames toward the old action no longer apply
+     if (!_ptmpl->FSetActnCel(_pbody, anid, 0))
+         return fFalse;
+     _anid = anid;
+@@ -243,15 +251,85 @@ bool APE::FCmdNextCel(PCMD pcmd)
+     AssertThis(0);
+     AssertVarMem(pcmd);
+ 
++    int32_t dtim = kdtimFrame;
++
+     if (_fCycleCels)
+     {
+-        FDisplayCel(_celn + 1);
++        if (_cInterp <= 1)
++            FDisplayCel(_celn + 1);
++        else
++            dtim = _DtimCycleStep();
+     }
+ 
+-    _clok.FSetAlarm(kdtimFrame, this);
++    _clok.FSetAlarm(dtim, this);
+     return fTrue;
+ }
+ 
++/***************************************************************************
++    One alarm's worth of cel cycling with frame interpolation on.  Each cel
++    is shown for kdtimFrame clock ticks, split into _cInterp frames:  the
++    cel itself, then blended frames part of the way to the next cel.  The
++    next cel is only shown when its own turn comes, exactly as without
++    interpolation, so the action's speed doesn't change.
++
++    Returns how many clock ticks to wait before the next alarm.
++***************************************************************************/
++int32_t APE::_DtimCycleStep(void)
++{
++    AssertThis(0);
++
++    int32_t isub = _isubInterp;
++
++    if (isub == 0)
++    {
++        // Show the next cel itself
++        FDisplayCel(_celn + 1);
++
++        // Then work out whether the step from it to the one after can be
++        // blended.  Capture this cel, set up the next one to capture it
++        // too, and go back to this one.  Models are compared too, so a
++        // step that swaps a part's model (which can't be blended yet)
++        // is just held for the whole cel, the same as without interpolation.
++        _fInterpBlend = fFalse;
++        _pbody->CapturePose(0);
++        if (_ptmpl->FSetActnCel(_pbody, _anid, _celn + 1))
++        {
++            _pbody->CapturePose(1);
++            _fInterpBlend = (kposeDiffer == _pbody->DiffPoses());
++            _pbody->ApplyPose(0);
++        }
++
++        if (!_fInterpBlend)
++            return kdtimFrame;
++        _isubInterp = 1;
++        return posebld::DtimSlice(0, _cInterp, kdtimFrame);
++    }
++
++    // A blended frame on the way to the next cel
++    _pbody->BlendPoses((float)isub / (float)_cInterp);
++    _UpdateView();
++    _isubInterp = (isub + 1 < _cInterp) ? isub + 1 : 0;
++    return posebld::DtimSlice(isub, _cInterp, kdtimFrame);
++}
++
++/***************************************************************************
++    Stops any blended frames in progress and puts the body back on the cel
++    it is on, so something that changes the body (a costume, the action, the
++    shape) doesn't get undone by a stale blend.  Does nothing if no blend
++    is in progress.
++***************************************************************************/
++void APE::_EndInterp(void)
++{
++    AssertThis(0);
++
++    if (_isubInterp == 0)
++        return;
++
++    _isubInterp = 0;
++    if (_ptmpl->FSetActnCel(_pbody, _anid, _celn))
++        _UpdateView();
++}
++
+ /***************************************************************************
+     Time to move to the next cel of the action.
+ ***************************************************************************/
+@@ -259,6 +337,9 @@ bool APE::FDisplayCel(int32_t celn)
+ {
+     AssertThis(0);
+ 
++    // Showing a cel directly ends any blend toward the one after it
++    _isubInterp = 0;
++
+     // Someone else will push an error if this fails
+     if (_ptmpl->FSetActnCel(_pbody, _anid, celn))
+     {
+@@ -275,6 +356,8 @@ bool APE::FDisplayCel(int32_t celn)
+ void APE::SetCycleCels(bool fOn)
+ {
+     AssertThis(0);
++    if (!fOn)
++        _EndInterp(); // don't stop halfway between two cels
+     _fCycleCels = fOn;
+ }
+ 
+@@ -569,6 +652,8 @@ bool APE::_FApplyGms(GMS *pgms, int32_t ibset)
+     PMTRL pmtrl;
+     PCMTL pcmtl;
+ 
++    _EndInterp(); // a costume can swap models, which a stale blend would undo
++
+     if (pgms->fMtrl)
+     {
+         pmtrl = (PMTRL)vptagm->PbacoFetch(&pgms->tagMtrl, MTRL::FReadMtrl);
+@@ -598,6 +683,8 @@ bool APE::_FIncCmtl(GMS *pgms, int32_t ibset, bool fNextAccessory)
+     AssertVarMem(pgms);
+     AssertIn(ibset, 0, _pbody->Cbset());
+ 
++    _EndInterp(); // a costume can swap models, which a stale blend would undo
++
+     int32_t cmid;
+     int32_t cmidNext;
+     int32_t icmid;
+@@ -711,6 +798,8 @@ bool APE::FChangeTdt(PSTN pstn, int32_t tdts, PTAG ptagTdf)
+     PTDT ptdtNew = pvNil;
+     PBODY pbodyNew = pvNil;
+ 
++    _EndInterp(); // the body is about to be rebuilt
++
+     ptdtNew = ((PTDT)_ptmpl)->PtdtDup();
+     if (pvNil == ptdtNew)
+         goto LFail;
+diff --git a/src/studio/utest.cpp b/src/studio/utest.cpp
+index 248c433..4d997e8 100644
+--- a/src/studio/utest.cpp
++++ b/src/studio/utest.cpp
+@@ -1384,6 +1384,7 @@ bool APP::_FReadUserData(void)
+     UDAT udat;
+     int32_t iprid;
+     int32_t fEnableFeature;
++    int32_t lwInterp;
+ 
+     ClearPb(&udat, SIZEOF(UDAT));
+ 
+@@ -1406,6 +1407,22 @@ bool APP::_FReadUserData(void)
+     (void)FGetSetRegKey(kszStereoSound, &fEnableFeature, SIZEOF(fEnableFeature), fregNil);
+     FSetProp(kpridStereoSoundPlayback, fEnableFeature);
+ 
++    fEnableFeature = klwFrameInterpolationDefault;
++    (void)FGetSetRegKey(kszFrameInterpolation, &fEnableFeature, SIZEOF(fEnableFeature), fregNil);
++    FSetProp(kpridFrameInterpolation, fEnableFeature);
++
++    // Blending one model into another needs the models to remember their
++    // vertices and faces, which costs memory, so only do that if asked to.
++    // It has to be set before any model is loaded.
++    lwInterp = fEnableFeature;
++    fEnableFeature = klwFrameInterpolationVertexDefault;
++    (void)FGetSetRegKey(kszFrameInterpolationVertex, &fEnableFeature, SIZEOF(fEnableFeature), fregNil);
++    MODL::SetKeepOriginals(lwInterp > 1 && fEnableFeature != 0);
++
++    fEnableFeature = klwFrameInterpolationJumpDefault;
++    (void)FGetSetRegKey(kszFrameInterpolationJump, &fEnableFeature, SIZEOF(fEnableFeature), fregNil);
++    FSetProp(kpridFrameInterpolationJump, fEnableFeature);
++
+     return fTrue;
+ }
+ 

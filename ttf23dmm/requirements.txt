@@ -1,0 +1,6 @@
+fonttools
+skia-pathops
+shapely
+mapbox_earcut
+numpy
+pillow
