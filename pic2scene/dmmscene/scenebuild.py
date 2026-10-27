@@ -206,6 +206,17 @@ def build(
     return sc, th
 
 
+def vxp_cfg(name, author, content, generator):
+    """the .cfg of a VXP, with every required field"""
+    import time
+
+    author = author or "Unknown"
+    return (
+        "Name=%s\nAuthor=%s\nOriginal Author=%s\nType=Portable\nContent=%s\nDate=%d\nGenerator=%s\n"
+        % (name, author, author, content, int(time.time()), generator)
+    )
+
+
 def write_vxp(path, base, sc, th, title, author=""):
     import io
     import os
@@ -217,8 +228,6 @@ def write_vxp(path, base, sc, th, title, author=""):
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         z.write(os.path.join(d, base + ".3cn"), base + ".3cn")
         z.write(os.path.join(d, base + ".3th"), base + ".3th")
-        cfg = ["Name=%s" % title]
-        if author:
-            cfg.append("Author=%s" % author)
-        cfg += ["Content=Backgrounds", "Generator=3DMM Scene Maker for Blender"]
-        z.writestr(base + ".cfg", "\r\n".join(cfg) + "\r\n")
+        z.writestr(
+            base + ".cfg", vxp_cfg(title, author, "Backgrounds", "3DMM Pic2Scene")
+        )
