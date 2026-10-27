@@ -1,10 +1,10 @@
 bl_info = {
     "name": "3DMM Scene Maker",
-    "author": "Lu9",
-    "version": (0, 2, 1),
+    "author": "Luke + Claude",
+    "version": (0, 2, 2),
     "blender": (3, 6, 0),
     "location": "Properties > Scene > 3DMM Scene Maker",
-    "description": "Render Blender cameras as Microsoft 3D Movie Maker scenes (image + depth) and export as v3DMM expansions",
+    "description": "Render Blender cameras as 3D Movie Maker scenes (image + depth) and export a .vxp",
     "category": "Import-Export",
 }
 
@@ -45,15 +45,15 @@ class DMMCamItem(bpy.types.PropertyGroup):
 
 
 class DMMSettings(bpy.types.PropertyGroup):
-    addon_name: StringProperty(name="Addon name", default="My Scene",
-                               description="Name of the v3DMM expansion")
-    author: StringProperty(name="Author", default="", description="Author of the v3DMM expansion")
+    addon_name: StringProperty(name="Addon name", default="My Scene Pack",
+                               description="Name of the expansion: the .vxp file name and the Name= entry in its .cfg")
+    author: StringProperty(name="Author", default="", description="Author= entry in the .cfg")
     scene_name: StringProperty(name="Scene name", default="ZZ-My Scene",
-                               description="Name shown in 3DMM's background browser (default ones look like 'MY-Street Background')")
+                               description="Name shown in 3DMM's background browser (stock ones look like 'MY-Street Background')")
     bkgds_path: StringProperty(name="bkgds.3cn", subtype='FILE_PATH',
-                               description="bkgds.3cn from your 3DMM install. The shared actor colors are read from it, "
-                                           "and snds.3cn next to it provides the song list")
-    output_dir: StringProperty(name="Output folder", subtype='DIR_PATH', default="~")
+                               description="bkgds.3cn from your 3DMM install. The shared actor colours are read from it, "
+                                           "and snds.3cn next to it provides the stock song list")
+    output_dir: StringProperty(name="Output folder", subtype='DIR_PATH', default="//")
     scale: FloatProperty(name="Scale", default=1.0, min=0.0001,
                          description="3DMM units per Blender unit (world scale)")
     ground_z: FloatProperty(name="Ground height", default=0.0, unit='LENGTH',
@@ -64,15 +64,15 @@ class DMMSettings(bpy.types.PropertyGroup):
     cam_index: IntProperty()
     music: StringProperty(name="Music", default="Imaginopolis Theme", search=_song_search,
                           search_options={'SUGGESTION'},
-                          description="A default 3DMM song (type to search), or the path to a .mid file to embed. '(none)' for silence")
+                          description="A stock song (type to search), or the path to a .mid file to embed. '(none)' for silence")
     light_mode: EnumProperty(name="Lights", items=[
-        ('LAMPS', "Scene lights", "Each Blender light (up to 2, brightest first) becomes a directional light in the scene"),
-        ('STOCK', "3DMM default", "The light used in the Misty City background"),
+        ('LAMPS', "Scene lamps", "Each Blender lamp (up to 2, brightest first) becomes a directional light aimed like the lamp"),
+        ('STOCK', "Stock default", "The light used by the stock Street background"),
     ], default='LAMPS')
     light_strength: FloatProperty(name="Light strength", default=1.0, min=0.0, soft_max=2.0)
     cno_base: IntProperty(name="Chunk number base", default=0, min=0,
                           description="0 = derived from the scene name. Set it to keep the same numbers when you rename a scene")
-    dither: BoolProperty(name="Dither", default=True, description="Use Floyd-Steinberg dithering on the image")
+    dither: BoolProperty(name="Dither", default=False, description="Floyd-Steinberg dithering (slow)")
 
 
 # ---------------------------------------------------------------- camera list
@@ -126,7 +126,7 @@ class DMM_UL_cams(bpy.types.UIList):
         ob = context.scene.objects.get(item.name)
         first = index == next((k for k, c in enumerate(data.cams) if c.use), -1)
         row.label(text=item.name, icon='OUTLINER_OB_CAMERA' if ob else 'ERROR')
-        if first and item.use: row.label(text="scene thumbnail", icon='IMAGE_DATA')
+        if first and item.use: row.label(text="first / thumbnail", icon='IMAGE_DATA')
 
 
 # ---------------------------------------------------------------- rendering
@@ -204,7 +204,7 @@ def _lights(scene, st, aim_point):
 # ---------------------------------------------------------------- export
 class DMM_OT_export(bpy.types.Operator):
     bl_idname = "dmm.export_vxp"
-    bl_label = "Export v3DMM expansion (.vxp)"
+    bl_label = "Export 3DMM scene (.vxp)"
 
     def execute(self, context):
         scene = context.scene; st = scene.dmm
@@ -231,7 +231,7 @@ class DMM_OT_export(bpy.types.Operator):
             songs = S.stock_songs(_snds_path(st))
             hit = {k.lower(): v for k, v in songs.items()}.get(m.lower())
             if hit is None:
-                self.report({'ERROR'}, "Unknown song '%s' (type to search the list)" % m); return {'CANCELLED'}
+                self.report({'ERROR'}, "Unknown stock song '%s' (type to search the list)" % m); return {'CANCELLED'}
             music = (hit[0], 'MSND', hit[1])
         r = scene.render; saved = (r.resolution_x, r.resolution_y, r.resolution_percentage, r.pixel_aspect_x,
                                    r.pixel_aspect_y, r.filepath, r.image_settings.file_format,
@@ -280,7 +280,7 @@ class DMM_OT_export(bpy.types.Operator):
 # ---------------------------------------------------------------- UI
 class DMM_PT_panel(bpy.types.Panel):
     bl_label = "3DMM Scene Maker"
-    bl_idname = "3DMMSM_PT_panel"
+    bl_idname = "DMM_PT_panel"
     bl_space_type = 'PROPERTIES'
     bl_region_type = 'WINDOW'
     bl_context = "scene"
@@ -295,9 +295,9 @@ class DMM_PT_panel(bpy.types.Panel):
 
         b = l.box(); b.label(text="World")
         b.prop(st, "scale"); b.prop(st, "ground_z")
-        b.label(text="Empties named 'Spawn1', 'Spawn2', etc. = actor spawn points", icon='INFO')
+        b.label(text="Empties named 'Spawn*' = actor start points", icon='INFO')
 
-        b = l.box(); b.label(text="Camera angles (first one is used as the scene thumbnail)")
+        b = l.box(); b.label(text="Camera angles (first one = thumbnail)")
         b.prop(st, "camera_collection")
         row = b.row()
         row.template_list("DMM_UL_cams", "", st, "cams", st, "cam_index", rows=4)
@@ -312,7 +312,7 @@ class DMM_PT_panel(bpy.types.Panel):
         row = b.row(align=True); row.prop(st, "music", text="Song"); row.operator("dmm.pick_midi", icon='FILEBROWSER', text="")
         try:
             S.stock_songs(_snds_path(st))
-            b.label(text="Default songs: " + ", ".join(S.last_song_notes), icon='CHECKMARK')
+            b.label(text="Stock songs: " + ", ".join(S.last_song_notes), icon='CHECKMARK')
         except Exception as ex:
             b.label(text="Song list unavailable: %s" % ex, icon='ERROR')
 
