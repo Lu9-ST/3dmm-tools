@@ -1,0 +1,177 @@
+--- a/src/engine/mtrl.cpp
++++ b/src/engine/mtrl.cpp
+@@ -11,6 +11,9 @@
+ ***************************************************************************/
+ #include "soc.h"
+ #include <math.h>
++#include <ctype.h>
++#include <string>
++#include <vector>
+ #include <stdlib.h>
+ ASSERTNAME
+ 
+@@ -28,6 +31,69 @@
+ const uint8_t kbOpaque = 0xff;
+ 
+ PTMAP MTRL::_ptmapShadeTable = pvNil; // shade table for all MTRLs
++PTMAP MTRL::_ptmapFlatTable = pvNil;  // identity shade table for content that is not to be shaded
++static std::vector<std::string> _vecFlatContent;
++
++static std::string _StdLowerNoExt(const char *psz)
++{
++    std::string s;
++    for (; *psz != 0; psz++)
++        s += (char)tolower((unsigned char)*psz);
++    size_t ich = s.rfind('.');
++    if (ich != std::string::npos && (s.compare(ich, std::string::npos, ".vxp") == 0 ||
++                                     s.compare(ich, std::string::npos, ".3cn") == 0))
++        s.erase(ich);
++    return s;
++}
++
++void MTRL::SetFlatContent(PCSZ pszList)
++{
++    _vecFlatContent.clear();
++    if (pszList == pvNil)
++        return;
++    std::string sItem;
++    for (const char *p = pszList;; p++)
++    {
++        if (*p == ',' || *p == ';' || *p == 0)
++        {
++            // trim
++            size_t ichFirst = sItem.find_first_not_of(" \t");
++            size_t ichLast = sItem.find_last_not_of(" \t");
++            if (ichFirst != std::string::npos)
++            {
++                std::string s = _StdLowerNoExt(sItem.substr(ichFirst, ichLast - ichFirst + 1).c_str());
++                if (!s.empty())
++                    _vecFlatContent.push_back(s);
++            }
++            sItem.clear();
++            if (*p == 0)
++                break;
++        }
++        else
++            sItem += *p;
++    }
++}
++
++// Is this content file one that is to be drawn without shading?  An unpacked VXP is called vxp_<name>_<crc>.3cn
++static bool _FFlatContent(PCFL pcfl)
++{
++    if (_vecFlatContent.empty())
++        return fFalse;
++
++    FNI fni;
++    STN stn;
++    pcfl->GetFni(&fni);
++    fni.GetLeaf(&stn);
++    std::string sLeaf = _StdLowerNoExt(stn.Psz());
++    for (size_t i = 0; i < _vecFlatContent.size(); i++)
++    {
++        const std::string &s = _vecFlatContent[i];
++        // vxp_<name>_<8 hex digits of the crc>
++        if (sLeaf == s || (sLeaf.size() == s.size() + 13 && sLeaf.compare(0, s.size() + 5, "vxp_" + s + "_") == 0))
++            return fTrue;
++    }
++    return fFalse;
++}
+ 
+ // The 146 colours of the 3DMM palette that content may use (palette indices 10..155).  Indices 15..150 hold 17 colour
+ // ramps of 8 shades, each starting at a multiple of 8 plus 15.
+@@ -230,6 +296,23 @@
+             _FillShadeTable(prgb, pbpmp->row_bytes, pbpmp->width, pbpmp->height, fFalse);
+         }
+     }
++
++    // Content that is to stay unshaded gets a table of its own with every row the identity
++    ReleasePpo(&_ptmapFlatTable);
++    if (fShadeTextures && !_vecFlatContent.empty())
++    {
++        _ptmapFlatTable = TMAP::PtmapRead(pcfl, ctg, cno);
++        if (pvNil != _ptmapFlatTable)
++        {
++            BPMP *pbpmpFlat = _ptmapFlatTable->Pbpmp();
++            if (pbpmpFlat->type == BR_PMT_INDEX_8 && pbpmpFlat->width == 256 && pbpmpFlat->height >= 2 &&
++                pbpmpFlat->pixels != pvNil)
++                _FillShadeTable((uint8_t *)pbpmpFlat->pixels, pbpmpFlat->row_bytes, pbpmpFlat->width,
++                                pbpmpFlat->height, fTrue);
++            else
++                ReleasePpo(&_ptmapFlatTable);
++        }
++    }
+     return fTrue;
+ }
+ 
+@@ -365,10 +448,13 @@
+         _pbmtl->colour_map = ptmap->Pbpmp();
+         Assert((PTMAP)_pbmtl->colour_map->identifier == ptmap, "lost tmap!");
+         AssertPo(_ptmapShadeTable, 0);
+-        _pbmtl->index_shade = _ptmapShadeTable->Pbpmp();
+-        _pbmtl->flags |= BR_MATF_MAP_COLOUR;
+-        _pbmtl->index_base = 0;
+-        _pbmtl->index_range = _ptmapShadeTable->Pbpmp()->height - 1;
++        {
++            PTMAP ptmapShade = (pvNil != _ptmapFlatTable && _FFlatContent(pcfl)) ? _ptmapFlatTable : _ptmapShadeTable;
++            _pbmtl->index_shade = ptmapShade->Pbpmp();
++            _pbmtl->flags |= BR_MATF_MAP_COLOUR;
++            _pbmtl->index_base = 0;
++            _pbmtl->index_range = ptmapShade->Pbpmp()->height - 1;
++        }
+ 
+         /* Look for a texture transform for the MTRL */
+         if (pcfl->FGetKidChidCtg(ctg, cno, 0, kctgTxxf, &kid))
+--- a/inc/mtrl.h
++++ b/inc/mtrl.h
+@@ -59,6 +59,7 @@
+ 
+   protected:
+     static PTMAP _ptmapShadeTable; // shade table for all MTRLs
++    static PTMAP _ptmapFlatTable;  // identity shade table (textures drawn as they are) for FlatContent, or pvNil
+     PBMTL _pbmtl;
+ 
+   protected:
+@@ -70,6 +71,12 @@
+ 
+   public:
+     static bool FSetShadeTable(PCFL pcfl, CTG ctg, CNO cno, bool fShadeTextures = fFalse);
++
++    // Content (VXPs, or content files like tmpls) whose textures are not shaded by the scene lighting even if
++    // shading is on, e.g. because the textures have lighting painted in.  pszList is a list of names separated by
++    // commas: a VXP name (with or without .vxp) or the name of a content file (with or without .3cn).  Call before
++    // FSetShadeTable and before any content is loaded.
++    static void SetFlatContent(PCSZ pszList);
+     static PMTRL PmtrlNew(int32_t iclrBase = ivNil, int32_t cclr = ivNil);
+     static bool FReadMtrl(PCRF pcrf, CTG ctg, CNO cno, PBLCK pblck, PBACO *ppbaco, int32_t *pcb);
+     static PMTRL PmtrlNewFromPix(PFNI pfni);
+--- a/src/studio/utest.cpp
++++ b/src/studio/utest.cpp
+@@ -361,6 +361,13 @@
+ 
+         (void)FGetSetRegKey(kszShadeTextures, &fShadeTextures, SIZEOF(fShadeTextures), fregNil);
+         (void)FGetSetRegKey(kszDither, &lwDither, SIZEOF(lwDither), fregNil);
++        {
++            SZ szFlat;
++            szFlat[0] = chNil;
++            if (!FGetSetRegKey(kszFlatContent, szFlat, SIZEOF(szFlat), fregString))
++                szFlat[0] = chNil;
++            MTRL::SetFlatContent(szFlat);
++        }
+ #ifdef BR_ZB_DITHER_BAYER8
+         BrZbSetDither(lwDither != 0 ? BR_ZB_DITHER_BAYER8 : BR_ZB_DITHER_NONE);
+ #endif
+--- a/inc/utest.h
++++ b/inc/utest.h
+@@ -80,6 +80,11 @@
+ // 0 = none (original), 1 = Bayer 8x8 ordered dither
+ #define kszDither PszLit("Dither")
+ #define klwDitherDefault 0
++
++// With ShadeTextures on: names of content that is not to be shaded (e.g. models with lighting baked into their
++// textures, or ones that should look flat), separated by commas.  A VXP name with or without .vxp, or a content
++// file name (tmpls, ...).  Example: FlatContent=Doraemon, MyActor.vxp
++#define kszFlatContent PszLit("FlatContent")
+ #define kszHighQualitySoundImportDefault fFalse
+ 
+ // If fTrue, mix sound in 44.1KHz 16-bit Stereo

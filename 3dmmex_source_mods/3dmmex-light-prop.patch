@@ -1,0 +1,655 @@
+diff -ruN a/bren/bwld.cpp b/bren/bwld.cpp
+--- a/bren/bwld.cpp	2026-10-31 10:41:13.254648441 +0000
++++ b/bren/bwld.cpp	2026-10-31 10:41:13.256197695 +0000
+@@ -508,6 +508,16 @@
+     // Render the scene.  This will add stuff to _pregnDirtyWorking
+     BrZbSceneRender(&_bactWorld, &_bactCamera, &_bpmpRGB, &_bpmpZ);
+ 
++    // Let the BODYs take back what they added to the world for this render (point lights)
++    if (pvNil != _pfnendrend)
++    {
++        for (pbact = _bactWorld.children; pvNil != pbact; pbact = pbact->next)
++        {
++            if (pbact->type == BR_ACTOR_NONE)
++                _pfnendrend(pbact);
++        }
++    }
++
+     for (pbact = _bactWorld.children; pvNil != pbact; pbact = pbact->next)
+     {
+         // BODY roots are BR_ACTOR_NONE
+diff -ruN a/bren/inc/bwld.h b/bren/inc/bwld.h
+--- a/bren/inc/bwld.h	2026-10-31 10:41:13.263265334 +0000
++++ b/bren/inc/bwld.h	2026-10-31 10:41:13.264975397 +0000
+@@ -19,6 +19,10 @@
+ typedef void FNBEGINREND(PBACT pbact);
+ typedef FNBEGINREND *PFNBEGINREND;
+ 
++// Callback function per root BACT when we are done rendering
++typedef void FNENDREND(PBACT pbact);
++typedef FNENDREND *PFNENDREND;
++
+ // Callback function per root BACT to get the rendered rectangle
+ typedef void FNGETRECT(PBACT pbact, RC *prc);
+ typedef FNGETRECT *PFNGETRECT;
+@@ -55,6 +59,7 @@
+     bool _fHalfY;                // Render at half vertical resolution
+     bool _fWorldChanged;         // Need to rerender?
+     PFNBEGINREND _pfnbeginrend;  // Callback to each actor before rendering
++    PFNENDREND _pfnendrend;      // Callback to each actor after rendering
+     PFNBACTREND _pfnbactrend;    // Callback when an actor is rendered
+     PFNGETRECT _pfngetrect;      // Callback to get an actor's bounding rect
+     PBACT _pbactClosestClicked;  // The closest actor that has been clicked
+@@ -108,6 +113,10 @@
+     {
+         _pfnbeginrend = pfnbeginrend;
+     }
++    void SetEndRenderCallback(PFNENDREND pfnendrend)
++    {
++        _pfnendrend = pfnendrend;
++    }
+     void SetActorRenderedCallback(PFNBACTREND pfnbactrend)
+     {
+         _pfnbactrend = pfnbactrend;
+diff -ruN a/inc/body.h b/inc/body.h
+--- a/inc/body.h	2026-10-31 10:41:13.245445925 +0000
++++ b/inc/body.h	2026-10-31 10:41:13.246977979 +0000
+@@ -68,6 +68,12 @@
+     BODYPOSE _rgbpose[2]; // pose snapshots for frame interpolation (0 = from, 1 = to)
+     int32_t _cbactPosePart; // part count the pose buffers were allocated for
+     PMODL *_prgpmodlMorph;  // scratch models for blending a part's model into another (made when first needed)
++    bool _fLight;           // this BODY is a point light prop
++    bool _fLightOn;         // its light is in the world (only while rendering)
++    BACT _bactLight;        // the light's actor (only in the world while rendering)
++    BLIT _blitLight;        // the light
++    static bool _fHideLights;   // movie is playing: the light props can't be seen (they still light)
++    static int32_t _cLightsOn;  // how many light props are lighting the render that is in progress
+ 
+   protected:
+     BODY(void)
+@@ -106,6 +112,9 @@
+                                           BVEC3 *pbvec3RayDir, BRS dzpNear, BRS dzpFar, void *pvArg);
+     static void _BactRendered(PBACT pbact, RC *prc);
+     static void _PrepareToRender(PBACT pbact);
++    static void _EndRender(PBACT pbact);
++    void _AddLight(void);
++    void _RemoveLight(void);
+     static void _GetRc(PBACT pbact, RC *prc);
+ 
+   public:
+@@ -131,6 +140,17 @@
+ 
+     static void SetHiliteColor(int32_t iclr);
+ 
++    // Point light props: a light prop has a point light at its origin that lights the other BODYs in the world
++    // while it's in view.  It can be seen when editing, not when the movie plays.  Scaling the prop makes
++    // the light reach further.
++    void SetLight(bool fLight);
++    bool FIsLight(void)
++    {
++        return _fLight;
++    }
++    static void SetPlaying(bool fPlaying, PBWLD pbwld);
++    static void SetLightRadius(float rRadius);
++
+     void LocateOrient(BRS xr, BRS yr, BRS zr, BMAT34 *pbmat34);
+     void SetPartModel(int32_t ibact, MODL *pmodl);
+     void SetPartMatrix(int32_t ibact, BMAT34 *pbmat34);
+diff -ruN a/inc/movie.h b/inc/movie.h
+--- a/inc/movie.h	2026-10-31 10:41:13.473929924 +0000
++++ b/inc/movie.h	2026-10-31 10:41:13.477314327 +0000
+@@ -918,6 +918,7 @@
+     void SetFPlaying(bool f)
+     {
+         _fPlaying = f;
++        BODY::SetPlaying(f, Pbwld());
+         if (!f)
+             SetFWriteBmps(fFalse);
+     }  // Set the playing flag.
+@@ -925,6 +926,7 @@
+     void SetFPlaying(bool f)
+     {
+         _fPlaying = f;
++        BODY::SetPlaying(f, Pbwld());
+     } // Set the playing flag.
+ #endif // !DEBUG
+     void SetFStopPlaying(bool f)
+diff -ruN a/inc/tmpl.h b/inc/tmpl.h
+--- a/inc/tmpl.h	2026-10-31 10:41:13.226318394 +0000
++++ b/inc/tmpl.h	2026-10-31 10:41:13.230593869 +0000
+@@ -163,6 +163,7 @@
+     int32_t _cbset;   // Count of body part sets
+     int32_t _cactn;   // Count of actions
+     STN _stn;         // Template name
++    bool _fLight;     // This is a point light prop (it comes from a VXP with Content=Light in its .cfg)
+ 
+   protected:
+     TMPL(void)
+@@ -179,6 +180,14 @@
+     ~TMPL(void);
+     static PGL PgltagFetch(PCFL pcfl, CTG ctg, CNO cno, bool *pfError);
+ 
++    // Point light props.  The VXP loader tells us which unpacked files are light props (the file name without
++    // its extension, like vxp_<name>_<crc>); a TMPL read from one of those files is a light.
++    static void AddLightFile(const char *pszLeafNoExt);
++    bool FIsLight(void)
++    {
++        return _fLight;
++    }
++
+     // TMPL / BODY stuff
+     void GetName(PSTN pstn); // default name of actor or text of the TDT
+     PBODY PbodyCreate(void); // Creates a body based on this TMPL
+diff -ruN a/inc/utest.h b/inc/utest.h
+--- a/inc/utest.h	2026-10-31 10:41:13.494023676 +0000
++++ b/inc/utest.h	2026-10-31 10:41:13.495686765 +0000
+@@ -85,6 +85,11 @@
+ // textures, or ones that should look flat), separated by commas.  A VXP name with or without .vxp, or a content
+ // file name (tmpls, ...).  Example: FlatContent=Doraemon, MyActor.vxp
+ #define kszFlatContent PszLit("FlatContent")
++
++// Point light props (a VXP whose .cfg says Content=Light): how far a light prop that isn't scaled reaches, in
++// tenths of a unit (40 = 4.0).  Scaling the prop in the movie scales this.
++#define kszLightRadius PszLit("LightRadius")
++#define klwLightRadiusDefault 40
+ #define kszHighQualitySoundImportDefault fFalse
+ 
+ // If fTrue, mix sound in 44.1KHz 16-bit Stereo
+diff -ruN a/src/engine/body.cpp b/src/engine/body.cpp
+--- a/src/engine/body.cpp	2026-10-31 10:41:13.233929909 +0000
++++ b/src/engine/body.cpp	2026-10-31 10:41:13.238924184 +0000
+@@ -113,6 +113,8 @@
+ ***************************************************************************/
+ #include "soc.h"
+ #include "posebld.h"
++
++#include <cmath>
+ ASSERTNAME
+ 
+ RTCLASS(BODY)
+@@ -531,6 +533,7 @@
+     pbodyDup->_pbwld = _pbwld;
+     pbodyDup->_fFound = _fFound;
+     pbodyDup->_ibset = _ibset;
++    pbodyDup->SetLight(_fLight);
+ 
+     if (!FAllocPv((void **)&pbodyDup->_prgbact, LwMul(_Cbact(), SIZEOF(BACT)), fmemClear, mprNormal))
+     {
+@@ -646,6 +649,7 @@
+         AssertPo(_pbwld, 0);
+         _pbwld->AddActor(_PbactRoot());
+         _pbwld->SetBeginRenderCallback(_PrepareToRender);
++        _pbwld->SetEndRenderCallback(_EndRender);
+         _pbwld->SetActorRenderedCallback(_BactRendered);
+         _pbwld->SetGetRcCallback(_GetRc);
+         _pbwld->MarkDirty(); // need to render
+@@ -1007,6 +1011,9 @@
+         pbody->_rcBounds.Zero();
+     }
+ 
++    if (pbody->_fLight)
++        pbody->_AddLight();
++
+     // Prepare bounding box, if BODY is highlighted
+     if (pbody->_PbactHilite()->type == BR_ACTOR_MODEL)
+     {
+@@ -1018,6 +1025,143 @@
+     }
+ }
+ 
++// How far (in model units, for a prop that isn't scaled) a light prop reaches.  At that distance the light has
++// dropped to a fifth of what it is right next to the prop.
++static float _rLightRadius = 4.0f;
++// Brightness right next to the light, as a factor of kd * cos(angle).  The materials of 3DMM have kd = 0.6.
++static const float krLightGain = 1.0f / 0.6f;
++// How far above the origin of a light prop (in model units) its light is
++static const float kLightLift = 0.5f;
++// Most light props that light one render (BRender has room for 16 lights, and the background uses some)
++static const int32_t kcLightsMax = 6;
++
++bool BODY::_fHideLights = fFalse;
++int32_t BODY::_cLightsOn = 0;
++
++/***************************************************************************
++    Sets how far a light prop of normal size reaches
++***************************************************************************/
++void BODY::SetLightRadius(float rRadius)
++{
++    if (rRadius >= 0.1f && rRadius <= 1000.0f)
++        _rLightRadius = rRadius;
++}
++
++/***************************************************************************
++    Makes this BODY a point light prop (or not)
++***************************************************************************/
++void BODY::SetLight(bool fLight)
++{
++    AssertBaseThis(0);
++
++    _fLight = fLight;
++    if (fLight)
++    {
++        ClearPb(&_bactLight, SIZEOF(BACT));
++        ClearPb(&_blitLight, SIZEOF(BLIT));
++        _blitLight.type = BR_LIGHT_POINT;
++        _blitLight.colour = BR_COLOUR_RGB(0xff, 0xff, 0xff);
++        _bactLight.type = BR_ACTOR_LIGHT;
++        _bactLight.type_data = &_blitLight;
++        _bactLight.t.type = BR_TRANSFORM_MATRIX34;
++        BrMatrix34Identity(&_bactLight.t.t.mat);
++    }
++}
++
++/***************************************************************************
++    The movie started or stopped playing.  Light props can't be seen when
++    it plays.
++***************************************************************************/
++void BODY::SetPlaying(bool fPlaying, PBWLD pbwld)
++{
++    if (fPlaying != _fHideLights)
++    {
++        _fHideLights = fPlaying;
++        if (pvNil != pbwld)
++            pbwld->MarkDirty(); // the light props have to appear or disappear
++    }
++}
++
++/***************************************************************************
++    BWLD is about to render the world: if this is a light prop, hide it if
++    the movie is playing, and put its light in the world.
++***************************************************************************/
++void BODY::_AddLight(void)
++{
++    AssertThis(0);
++
++    BACT *pbactRoot = _PbactRoot();
++    float rScale, rRadius, rQ;
++    int32_t i;
++
++    _fLightOn = fFalse;
++    pbactRoot->render_style = _fHideLights ? BR_RSTYLE_NONE : BR_RSTYLE_DEFAULT;
++    if (_cLightsOn >= kcLightsMax || pvNil == _pbwld)
++        return;
++
++    // The scale of the prop is the average length of the axes of its matrix
++    rScale = 0.0f;
++    for (i = 0; i < 3; i++)
++    {
++        float rx = BrScalarToFloat(pbactRoot->t.t.mat.m[i][0]);
++        float ry = BrScalarToFloat(pbactRoot->t.t.mat.m[i][1]);
++        float rz = BrScalarToFloat(pbactRoot->t.t.mat.m[i][2]);
++        rScale += sqrtf(rx * rx + ry * ry + rz * rz);
++    }
++    rScale /= 3.0f;
++    if (rScale < 0.01f)
++        return;
++
++    // Intensity at distance d is kd * cos / (c + q * d * d); c makes it krLightGain next to the light, q
++    // makes it a fifth of that at rRadius.  (BRender measures d in the model space of what is lit, so the
++    // scale of what is lit changes how far the light seems to reach.)
++    rRadius = _rLightRadius * rScale;
++    rQ = (4.0f / krLightGain) / (rRadius * rRadius);
++    _blitLight.attenuation_c = BrFloatToScalar(1.0f / krLightGain);
++    _blitLight.attenuation_l = BrFloatToScalar(0.0f);
++    _blitLight.attenuation_q = BrFloatToScalar(rQ);
++
++    // The light is kLightLift above the origin of the prop (props sit on the floor: that's where the middle of the
++    // orb of a light prop is), along the up axis of the prop, which includes its scale.
++    for (i = 0; i < 3; i++)
++    {
++        _bactLight.t.t.mat.m[3][i] =
++            pbactRoot->t.t.mat.m[3][i] + BrFloatToScalar(kLightLift * BrScalarToFloat(pbactRoot->t.t.mat.m[1][i]));
++    }
++    _bactLight.identifier = (schar *)this;
++    _bactLight.type_data = &_blitLight; // (not in SetLight: Restore swaps BODYs)
++    _pbwld->AddActor(&_bactLight);
++    BrLightEnable(&_bactLight);
++    _fLightOn = fTrue;
++    _cLightsOn++;
++}
++
++/***************************************************************************
++    Rendering is done: take the light out of the world again.
++***************************************************************************/
++void BODY::_RemoveLight(void)
++{
++    AssertThis(0);
++
++    if (_fLightOn)
++    {
++        BrLightDisable(&_bactLight);
++        BrActorRemove(&_bactLight);
++        _fLightOn = fFalse;
++        _cLightsOn--;
++    }
++}
++
++void BODY::_EndRender(PBACT pbact)
++{
++    AssertVarMem(pbact);
++
++    PBODY pbody = PbodyFromBact(pbact);
++
++    if (pvNil != pbody && pbody->_fLight)
++        pbody->_RemoveLight();
++}
++
+ /***************************************************************************
+     Return the bounds of the BODY contaning PBACT
+ ***************************************************************************/
+diff -ruN a/src/engine/scene.cpp b/src/engine/scene.cpp
+--- a/src/engine/scene.cpp	2026-10-31 10:41:13.397929919 +0000
++++ b/src/engine/scene.cpp	2026-10-31 10:41:13.401565588 +0000
+@@ -1104,6 +1104,15 @@
+         return; // only prerender if the movie is playing
+     }
+ 
++    // A light prop lights the other actors, wherever they are: they can't be prerendered (they would
++    // have to be rendered when the light was hidden, or without it).
++    for (ipactr = 0; ipactr < _pglpactr->IvMac(); ipactr++)
++    {
++        _pglpactr->Get(ipactr, &pactr);
++        if (pvNil != pactr->Pbody() && pactr->Pbody()->FIsLight())
++            return;
++    }
++
+     // Do prerender if this is the first frame of the scene
+     // (even though there's no sevtChngCamera), or if fStartNow
+     // is fTrue, or if there is a sevtChngCamera in this
+diff -ruN a/src/engine/tmpl.cpp b/src/engine/tmpl.cpp
+--- a/src/engine/tmpl.cpp	2026-10-31 10:41:13.213929908 +0000
++++ b/src/engine/tmpl.cpp	2026-10-31 10:41:13.218992223 +0000
+@@ -64,6 +64,9 @@
+ 
+ ***************************************************************************/
+ #include "soc.h"
++
++#include <set>
++#include <string>
+ ASSERTNAME
+ 
+ RTCLASS(ACTN)
+@@ -411,6 +414,46 @@
+     return fTrue;
+ }
+ 
++// Unpacked VXP files (without extension, lower case) that hold light props
++static std::set<std::string> _setLightFiles;
++
++/***************************************************************************
++    Remembers that content file pszLeafNoExt (like vxp_<name>_<crc>) is a
++    point light prop
++***************************************************************************/
++void TMPL::AddLightFile(const char *pszLeafNoExt)
++{
++    std::string s = pszLeafNoExt;
++    for (size_t i = 0; i < s.size(); i++)
++    {
++        if (s[i] >= 'A' && s[i] <= 'Z')
++            s[i] = (char)(s[i] - 'A' + 'a');
++    }
++    _setLightFiles.insert(s);
++}
++
++// Is this content file one of the light prop files?
++static bool _FLightFile(PCFL pcfl)
++{
++    if (_setLightFiles.empty())
++        return fFalse;
++
++    FNI fni;
++    STN stn;
++    pcfl->GetFni(&fni);
++    fni.GetLeaf(&stn);
++    std::string s = stn.Psz();
++    size_t ichDot = s.rfind('.');
++    if (ichDot != std::string::npos)
++        s.erase(ichDot);
++    for (size_t i = 0; i < s.size(); i++)
++    {
++        if (s[i] >= 'A' && s[i] <= 'Z')
++            s[i] = (char)(s[i] - 'A' + 'a');
++    }
++    return _setLightFiles.count(s) != 0;
++}
++
+ /***************************************************************************
+     Read a TMPL from a chunk
+ ***************************************************************************/
+@@ -426,6 +469,7 @@
+ 
+     if (!_FReadTmplf(pcfl, ctg, cno))
+         return fFalse;
++    _fLight = FIsProp() && _FLightFile(pcfl);
+ 
+     // read GLPI (parent tree)
+     if (!pcfl->FGetKidChidCtg(ctg, cno, 0, kctgGlpi, &kid))
+@@ -598,6 +642,7 @@
+         ReleasePpo(&pbody);
+         return pvNil;
+     }
++    pbody->SetLight(_fLight);
+     return pbody;
+ }
+ 
+diff -ruN a/src/studio/configstub.cpp b/src/studio/configstub.cpp
+--- a/src/studio/configstub.cpp	2026-10-31 10:41:13.541929928 +0000
++++ b/src/studio/configstub.cpp	2026-10-31 10:41:13.546291378 +0000
+@@ -47,6 +47,9 @@
+     // Dither lit surfaces (0 = off, 1 = Bayer 8x8)
+     {kszDither, "0", pvNil, pvNil, 0},
+ 
++    // How far a point light prop reaches, in tenths of a unit
++    {kszLightRadius, "40", pvNil, pvNil, 0},
++
+ };
+ 
+ bool FGetSetRegKey(PCSZ pszValueName, void *pvData, int32_t cbData, uint32_t grfreg, bool *pfNoValue)
+diff -ruN a/src/studio/utest.cpp b/src/studio/utest.cpp
+--- a/src/studio/utest.cpp	2026-10-31 10:41:13.481929924 +0000
++++ b/src/studio/utest.cpp	2026-10-31 10:41:13.486851413 +0000
+@@ -358,7 +358,10 @@
+     {
+         int32_t fShadeTextures = klwShadeTexturesDefault;
+         int32_t lwDither = klwDitherDefault;
++        int32_t lwLightRadius = klwLightRadiusDefault;
+ 
++        (void)FGetSetRegKey(kszLightRadius, &lwLightRadius, SIZEOF(lwLightRadius), fregNil);
++        BODY::SetLightRadius((float)lwLightRadius / 10.0f);
+         (void)FGetSetRegKey(kszShadeTextures, &fShadeTextures, SIZEOF(fShadeTextures), fregNil);
+         (void)FGetSetRegKey(kszDither, &lwDither, SIZEOF(lwDither), fregNil);
+         {
+diff -ruN a/src/studio/vxp.cpp b/src/studio/vxp.cpp
+--- a/src/studio/vxp.cpp	2026-10-31 10:41:13.045929898 +0000
++++ b/src/studio/vxp.cpp	2026-10-31 10:41:13.051724762 +0000
+@@ -102,6 +102,44 @@
+     return pfni->FSetLeaf(&stn, ftg);
+ }
+ 
++static bool FReadEntry(PFNI pfniVxp, const zipread::ZipEntry &zent, std::vector<uint8_t> *pvecData,
++                       std::string *psError);
++
++// Does the text of a VXP's .cfg file say "Content=Light"?  (the .cfg is v3DMM's "Key=Value" file;
++// 3DMMEx uses the Content key to tell what kind of thing the VXP adds)
++static bool FCfgIsLight(const std::vector<uint8_t> &vecCfg)
++{
++    std::string s(vecCfg.begin(), vecCfg.end());
++    size_t ich = 0;
++
++    while (ich < s.size())
++    {
++        size_t ichEnd = s.find_first_of("\r\n", ich);
++        if (ichEnd == std::string::npos)
++            ichEnd = s.size();
++        std::string sLine = s.substr(ich, ichEnd - ich);
++        ich = ichEnd + 1;
++
++        size_t ichEq = sLine.find('=');
++        if (ichEq == std::string::npos)
++            continue;
++        std::string sKey = sLine.substr(0, ichEq);
++        std::string sVal = sLine.substr(ichEq + 1);
++        // trim (and skip a UTF-8 byte order mark)
++        if (sKey.compare(0, 3, "\xEF\xBB\xBF") == 0)
++            sKey.erase(0, 3);
++        const char *pszWs = " \t";
++        size_t ichA = sKey.find_first_not_of(pszWs), ichB = sKey.find_last_not_of(pszWs);
++        sKey = (ichA == std::string::npos) ? "" : sKey.substr(ichA, ichB - ichA + 1);
++        ichA = sVal.find_first_not_of(pszWs);
++        ichB = sVal.find_last_not_of(pszWs);
++        sVal = (ichA == std::string::npos) ? "" : sVal.substr(ichA, ichB - ichA + 1);
++        if (StdLower(sKey) == "content")
++            return StdLower(sVal) == "light";
++    }
++    return fFalse;
++}
++
+ // Reads one VXP's directory and adds the files to unpack to *pvecEnt.
+ // Returns fFalse (with a message in *psError) if this isn't a usable zip.
+ static bool FReadVxp(PFNI pfni, int32_t ivxp, std::vector<VXPENT> *pvecEnt, std::string *psError)
+@@ -117,6 +155,8 @@
+     STN stnLeaf;
+     std::string sVxp;
+     int cFound = 0;
++    size_t ientFirst = pvecEnt->size(); // entries of this VXP start here
++    int32_t izentCfg = -1;              // the .cfg file, if there is one
+ 
+     if (pvNil == pfil)
+     {
+@@ -173,6 +213,10 @@
+             }
+             else
+             {
++                if (FEndsWith(sName, ".cfg") && sName.compare(0, 9, "__macosx/") != 0 &&
++                    sName.find("/._") == std::string::npos && izentCfg < 0 && z.cbSize < 0x10000 &&
++                    !(z.grf & 1) && (z.method == 0 || z.method == 8))
++                    izentCfg = (int32_t)i;
+                 continue;
+             }
+             if (sName.compare(0, 9, "__macosx/") == 0 || sName.find("/._") != std::string::npos)
+@@ -210,6 +254,24 @@
+             *psError = "no .3cn or .3th files inside";
+             goto LDone;
+         }
++        // Content=Light in the .cfg: the content in this VXP is a point light prop (see TMPL::FIsLight).
++        // (a problem with the .cfg only means it isn't one)
++        if (izentCfg >= 0)
++        {
++            std::vector<uint8_t> vecCfg;
++            std::string sCfgError;
++            if (FReadEntry(pfni, vecZent[izentCfg], &vecCfg, &sCfgError) && FCfgIsLight(vecCfg))
++            {
++                for (size_t ient = ientFirst; ient < pvecEnt->size(); ient++)
++                {
++                    if ((*pvecEnt)[ient].ftg == kftgContent)
++                    {
++                        const std::string &sFile = (*pvecEnt)[ient].stnFile;
++                        TMPL::AddLightFile(sFile.substr(0, sFile.rfind('.')).c_str());
++                    }
++                }
++            }
++        }
+         fRet = fTrue;
+     }
+     catch (const std::exception &)
+@@ -241,8 +303,9 @@
+     return fRet;
+ }
+ 
+-// Reads, checks and writes one file of a VXP, to the (temporary) pfniTmp
+-static bool FUnpackEntry(PFNI pfniVxp, const VXPENT &ent, PFNI pfniTmp, std::string *psError)
++// Reads and checks (size, crc) one file of a VXP into *pvecData
++static bool FReadEntry(PFNI pfniVxp, const zipread::ZipEntry &zent, std::vector<uint8_t> *pvecData,
++                       std::string *psError)
+ {
+     PFIL pfil = FIL::PfilOpen(pfniVxp);
+     bool fRet = fFalse;
+@@ -258,46 +321,41 @@
+     try
+     {
+         fpMac = pfil->FpMac();
+-        if ((uint64_t)ent.zent.ibLocal + 30 > (uint64_t)fpMac ||
+-            !pfil->FReadRgb(rgbHdr, 30, (FP)ent.zent.ibLocal) || !zipread::FLocalHeaderSize(rgbHdr, &cbHdr) ||
+-            (uint64_t)ent.zent.ibLocal + cbHdr + ent.zent.cbPacked > (uint64_t)fpMac)
++        if ((uint64_t)zent.ibLocal + 30 > (uint64_t)fpMac ||
++            !pfil->FReadRgb(rgbHdr, 30, (FP)zent.ibLocal) || !zipread::FLocalHeaderSize(rgbHdr, &cbHdr) ||
++            (uint64_t)zent.ibLocal + cbHdr + zent.cbPacked > (uint64_t)fpMac)
+         {
+             *psError = "damaged zip entry";
+             goto LDone;
+         }
+-        std::vector<uint8_t> vecPacked(ent.zent.cbPacked);
+-        std::vector<uint8_t> vecData(ent.zent.cbSize);
+-        if (ent.zent.cbPacked > 0 &&
+-            !pfil->FReadRgb(vecPacked.data(), (int32_t)ent.zent.cbPacked, (FP)(ent.zent.ibLocal + cbHdr)))
++        std::vector<uint8_t> vecPacked(zent.cbPacked);
++        pvecData->resize(zent.cbSize);
++        if (zent.cbPacked > 0 &&
++            !pfil->FReadRgb(vecPacked.data(), (int32_t)zent.cbPacked, (FP)(zent.ibLocal + cbHdr)))
+         {
+             *psError = "can't read the file";
+             goto LDone;
+         }
+-        if (ent.zent.method == 0)
++        if (zent.method == 0)
+         {
+-            if (ent.zent.cbPacked != ent.zent.cbSize)
++            if (zent.cbPacked != zent.cbSize)
+             {
+                 *psError = "damaged zip entry";
+                 goto LDone;
+             }
+-            if (ent.zent.cbSize > 0)
+-                memcpy(vecData.data(), vecPacked.data(), ent.zent.cbSize);
++            if (zent.cbSize > 0)
++                memcpy(pvecData->data(), vecPacked.data(), zent.cbSize);
+         }
+-        else if (!zipread::FInflate(vecPacked.data(), vecPacked.size(), vecData.data(), vecData.size()))
++        else if (!zipread::FInflate(vecPacked.data(), vecPacked.size(), pvecData->data(), pvecData->size()))
+         {
+             *psError = "damaged compressed data";
+             goto LDone;
+         }
+-        if (zipread::Crc32(vecData.data(), vecData.size()) != ent.zent.crc)
++        if (zipread::Crc32(pvecData->data(), pvecData->size()) != zent.crc)
+         {
+             *psError = "crc mismatch";
+             goto LDone;
+         }
+-        if (!FWriteFile(pfniTmp, vecData.data(), (uint32_t)vecData.size()))
+-        {
+-            *psError = "can't write the file";
+-            goto LDone;
+-        }
+         fRet = fTrue;
+     }
+     catch (const std::exception &)
+@@ -310,6 +368,28 @@
+     return fRet;
+ }
+ 
++// Reads, checks and writes one file of a VXP, to the (temporary) pfniTmp
++static bool FUnpackEntry(PFNI pfniVxp, const VXPENT &ent, PFNI pfniTmp, std::string *psError)
++{
++    try
++    {
++        std::vector<uint8_t> vecData;
++        if (!FReadEntry(pfniVxp, ent.zent, &vecData, psError))
++            return fFalse;
++        if (!FWriteFile(pfniTmp, vecData.data(), (uint32_t)vecData.size()))
++        {
++            *psError = "can't write the file";
++            return fFalse;
++        }
++        return fTrue;
++    }
++    catch (const std::exception &)
++    {
++        *psError = "out of memory";
++        return fFalse;
++    }
++}
++
+ // The directory 3DMM reads the "Expansions" source from, the same way TAGM
+ // finds it: the long name first, then the short one.
+ static bool FFindExpansionsDir(PFNI pfniMsKids, bool fCreate, FNI *pfniOut)

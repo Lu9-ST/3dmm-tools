@@ -1,0 +1,297 @@
+--- a/src/engine/mtrl.cpp
++++ b/src/engine/mtrl.cpp
+@@ -10,6 +10,8 @@
+ 
+ ***************************************************************************/
+ #include "soc.h"
++#include <math.h>
++#include <stdlib.h>
+ ASSERTNAME
+ 
+ RTCLASS(MTRL)
+@@ -27,17 +29,208 @@
+ 
+ PTMAP MTRL::_ptmapShadeTable = pvNil; // shade table for all MTRLs
+ 
++// The 146 colours of the 3DMM palette that content may use (palette indices 10..155).  Indices 15..150 hold 17 colour
++// ramps of 8 shades, each starting at a multiple of 8 plus 15.
++const int32_t kiclrPalFirst = 10;
++const int32_t kcclrPal = 146;
++const int32_t kiclrRampFirst = 15;
++const int32_t kcRamps = 17;
++const int32_t kcShadesPerRamp = 8;
++const int32_t kiShadeBase = 6; // the shade of a ramp that is "the colour itself"; 7 is a lighter highlight
++static const uint32_t _rglwPalette[kcclrPal] = {
++    0x5443b1, 0x007f7f, 0xefefef, 0x101010, 0x151515, 0x0b0b0b, 0x1b1b1b, 0x2c2c2c,
++    0x494949, 0x666666, 0x737373, 0x808080, 0x949494, 0xababab, 0xb6b6b6, 0xc4c4c4,
++    0xd1d1d1, 0xdedede, 0xe9e9e9, 0xf1f1f1, 0xf9f9f9, 0x17172f, 0x1b1b36, 0x181f43,
++    0x212c5c, 0x343f8b, 0x4a41a0, 0x5449b4, 0x675ccb, 0x766cd0, 0x7d5af5, 0x8767f5,
++    0x8e71f7, 0x877afa, 0xa385fc, 0xb49bfd, 0xbab0fd, 0x2c1b10, 0x452a19, 0x6b4427,
++    0x915d36, 0xb17242, 0xc9804b, 0xdd8c52, 0xe89555, 0xe8a15b, 0xe8b160, 0xe8b66a,
++    0xe8c067, 0xe8c070, 0xe8c86f, 0xe8d070, 0xe8cf7a, 0x380b0a, 0x541a18, 0x771c1c,
++    0x8d180c, 0xab1e12, 0xce171c, 0xec2020, 0xe84242, 0x141e2c, 0x223148, 0x304465,
++    0x374e73, 0x3e5782, 0x45618f, 0x4f70a6, 0x6281b3, 0x8a0b4a, 0xb10e60, 0xd91175,
++    0xec1380, 0xed278a, 0xee3c95, 0xf158a5, 0xf376b5, 0x3f1a01, 0x682b02, 0x923d03,
++    0xa74503, 0xbb4e04, 0xd05604, 0xef6905, 0xfa791b, 0x2c0c34, 0x491357, 0x661c79,
++    0x761f8b, 0x84239c, 0x9327ad, 0xa92dc8, 0xb740d5, 0x5e4702, 0x886702, 0xb18a03,
++    0xc69a04, 0xdbb604, 0xf0c704, 0xfad21b, 0xfbd939, 0x32320e, 0x545416, 0x747421,
++    0x848426, 0x95952b, 0xa5a530, 0xbdbd37, 0xcaca4a, 0x281a17, 0x432c27, 0x5e3d37,
++    0x6b453f, 0x784f47, 0x86574f, 0x9a645a, 0xa8756c, 0x16320e, 0x255317, 0x347421,
++    0x3a8525, 0x43952b, 0x49a62f, 0x55be36, 0x66cb49, 0x291617, 0x452527, 0x613436,
++    0x6f3c3e, 0x7c4346, 0x8a4a4d, 0x9f5559, 0xad676a, 0x063925, 0x0a613e, 0x0e8756,
++    0x109a63, 0x12ad70, 0x14c07b, 0x16d88a, 0x23e99a, 0x232323, 0x3a3a3a, 0x545454,
++    0x5c5c5c, 0x333333,
++};
++
++/***************************************************************************
++    Shade table for textured objects.
++
++    The table that shipped with the game maps every texel to itself on every
++    row, so lighting has no effect on textures.  This builds a real table:
++    row r (0 = dark .. last = fully lit) maps each palette colour to the
++    palette entry that looks like that colour under that much light, using
++    the brightness curve of the game's own colour ramps (so a textured
++    surface reacts to light like a solid-colour one).  The row where a solid
++    colour shows its base shade (13 of 16) leaves the texture untouched.
++    Same algorithm as the shadetab.py tool, which can write the table into
++    3dmovie.chk.
++***************************************************************************/
++static void _Lab(const double *prgdRgb, double *prgd)
++{
++    double rgdLin[3];
++    for (int32_t i = 0; i < 3; i++)
++    {
++        double d = prgdRgb[i] / 255.0;
++        rgdLin[i] = d > 0.04045 ? pow((d + 0.055) / 1.055, 2.4) : d / 12.92;
++    }
++    double x = (0.4124 * rgdLin[0] + 0.3576 * rgdLin[1] + 0.1805 * rgdLin[2]) / 0.95047;
++    double y = (0.2126 * rgdLin[0] + 0.7152 * rgdLin[1] + 0.0722 * rgdLin[2]) / 1.0;
++    double z = (0.0193 * rgdLin[0] + 0.1192 * rgdLin[1] + 0.9505 * rgdLin[2]) / 1.08883;
++    double fx = x > 0.008856 ? cbrt(x) : 7.787 * x + 16.0 / 116.0;
++    double fy = y > 0.008856 ? cbrt(y) : 7.787 * y + 16.0 / 116.0;
++    double fz = z > 0.008856 ? cbrt(z) : 7.787 * z + 16.0 / 116.0;
++    prgd[0] = 116.0 * fy - 16.0;
++    prgd[1] = 500.0 * (fx - fy);
++    prgd[2] = 200.0 * (fy - fz);
++}
++
++static void _RgbFromPal(uint32_t lwRgb, double *prgd)
++{
++    prgd[0] = (double)((lwRgb >> 16) & 0xFF);
++    prgd[1] = (double)((lwRgb >> 8) & 0xFF);
++    prgd[2] = (double)(lwRgb & 0xFF);
++}
++
++static double _DLuma(uint32_t lwRgb)
++{
++    return 0.299 * (double)((lwRgb >> 16) & 0xFF) + 0.587 * (double)((lwRgb >> 8) & 0xFF) +
++           0.114 * (double)(lwRgb & 0xFF);
++}
++
++// Is every row of the (width x height) shade table the identity?
++static bool _FIdentityShadeTable(const uint8_t *prgb, int32_t cbRow, int32_t dxp, int32_t dyp)
++{
++    for (int32_t iy = 0; iy < dyp; iy++)
++        for (int32_t ix = 0; ix < dxp; ix++)
++            if (prgb[iy * cbRow + ix] != ix)
++                return fFalse;
++    return fTrue;
++}
++
++static void _FillShadeTable(uint8_t *prgb, int32_t cbRow, int32_t dxp, int32_t dyp, bool fIdentity)
++{
++    int32_t ix, iy, iclr;
++
++    for (iy = 0; iy < dyp; iy++)
++        for (ix = 0; ix < dxp; ix++)
++            prgb[iy * cbRow + ix] = (uint8_t)ix;
++    if (fIdentity || dyp < 2)
++        return;
++
++    // average brightness of ramp shades 0..7 relative to shade 6
++    double rgdProfile[kcShadesPerRamp];
++    for (int32_t ish = 0; ish < kcShadesPerRamp; ish++)
++    {
++        double dSum = 0;
++        for (int32_t ir = 0; ir < kcRamps; ir++)
++        {
++            int32_t iclrBase = kiclrRampFirst - kiclrPalFirst + ir * kcShadesPerRamp;
++            double dBase = _DLuma(_rglwPalette[iclrBase + kiShadeBase]);
++            dSum += _DLuma(_rglwPalette[iclrBase + ish]) / (dBase > 1.0 ? dBase : 1.0);
++        }
++        rgdProfile[ish] = dSum / kcRamps;
++    }
++
++    // brightness factor of each row; 1.0 at the "normally lit" row (13 of 16)
++    auto pfnCurve = [&](double dt) {
++        double dPos = dt * (kcShadesPerRamp - 1);
++        int32_t i0 = (int32_t)dPos;
++        if (i0 >= kcShadesPerRamp - 1)
++            return rgdProfile[kcShadesPerRamp - 1];
++        return rgdProfile[i0] + (rgdProfile[i0 + 1] - rgdProfile[i0]) * (dPos - i0);
++    };
++    double dRef = pfnCurve(13.0 / 15.0);
++    double *prgdLab = (double *)malloc(kcclrPal * 3 * sizeof(double));
++    if (prgdLab == pvNil)
++        return;
++    for (iclr = 0; iclr < kcclrPal; iclr++)
++    {
++        double rgdRgb[3];
++        _RgbFromPal(_rglwPalette[iclr], rgdRgb);
++        _Lab(rgdRgb, prgdLab + 3 * iclr);
++    }
++
++    for (iy = 0; iy < dyp; iy++)
++    {
++        double dFac = pfnCurve((double)iy / (double)(dyp - 1)) / dRef;
++        if (fabs(dFac - 1.0) < 1e-9)
++            continue;
++        for (iclr = 0; iclr < kcclrPal; iclr++)
++        {
++            double rgdSrc[3], rgdTgt[3], rgdLabT[3];
++
++            _RgbFromPal(_rglwPalette[iclr], rgdSrc);
++            for (int32_t ic = 0; ic < 3; ic++)
++            {
++                // brighter than the base shade: the ramps tint toward white there
++                double d = dFac < 1.0 ? rgdSrc[ic] * dFac : rgdSrc[ic] + (255.0 - rgdSrc[ic]) * (dFac - 1.0) * 1.6;
++                rgdTgt[ic] = d < 0 ? 0 : (d > 255.0 ? 255.0 : d);
++            }
++            _Lab(rgdTgt, rgdLabT);
++            int32_t iclrBest = 0;
++            double dBest = 1e300;
++            for (int32_t ic = 0; ic < kcclrPal; ic++)
++            {
++                double d0 = prgdLab[3 * ic] - rgdLabT[0], d1 = prgdLab[3 * ic + 1] - rgdLabT[1],
++                       d2 = prgdLab[3 * ic + 2] - rgdLabT[2];
++                double dDist = d0 * d0 + d1 * d1 + d2 * d2;
++                if (dDist < dBest)
++                {
++                    dBest = dDist;
++                    iclrBest = ic;
++                }
++            }
++            if (kiclrPalFirst + iclr < dxp)
++                prgb[iy * cbRow + kiclrPalFirst + iclr] = (uint8_t)(kiclrPalFirst + iclrBest);
++        }
++    }
++    free(prgdLab);
++}
++
+ /***************************************************************************
+     Call this function to assign the global shade table.  It is read from
+     the given chunk.
++
++    fShadeTextures says whether textured objects should react to light:
++      fFalse - the shade table is forced to the identity (every row maps a
++               texel to itself), which is how the original game looks, even
++               if the content has a real table
++      fTrue  - a real table in the content is used as is; if the content's
++               table is the stock all-identity one, a real one is generated
+ ***************************************************************************/
+-bool MTRL::FSetShadeTable(PCFL pcfl, CTG ctg, CNO cno)
++bool MTRL::FSetShadeTable(PCFL pcfl, CTG ctg, CNO cno, bool fShadeTextures)
+ {
+     AssertPo(pcfl, 0);
+ 
+     ReleasePpo(&_ptmapShadeTable);
+     _ptmapShadeTable = TMAP::PtmapRead(pcfl, ctg, cno);
+-    return (pvNil != _ptmapShadeTable);
++    if (pvNil == _ptmapShadeTable)
++        return fFalse;
++
++    BPMP *pbpmp = _ptmapShadeTable->Pbpmp();
++    if (pbpmp->type == BR_PMT_INDEX_8 && pbpmp->width == 256 && pbpmp->height >= 2 && pbpmp->pixels != pvNil)
++    {
++        uint8_t *prgb = (uint8_t *)pbpmp->pixels;
++        bool fIdentity = _FIdentityShadeTable(prgb, pbpmp->row_bytes, pbpmp->width, pbpmp->height);
++
++        if (!fShadeTextures)
++        {
++            if (!fIdentity)
++                _FillShadeTable(prgb, pbpmp->row_bytes, pbpmp->width, pbpmp->height, fTrue);
++        }
++        else if (fIdentity)
++        {
++            _FillShadeTable(prgb, pbpmp->row_bytes, pbpmp->width, pbpmp->height, fFalse);
++        }
++    }
++    return fTrue;
+ }
+ 
+ /***************************************************************************
+--- a/inc/mtrl.h
++++ b/inc/mtrl.h
+@@ -69,7 +69,7 @@
+     bool _FInit(PCRF pcrf, CTG ctg, CNO cno);
+ 
+   public:
+-    static bool FSetShadeTable(PCFL pcfl, CTG ctg, CNO cno);
++    static bool FSetShadeTable(PCFL pcfl, CTG ctg, CNO cno, bool fShadeTextures = fFalse);
+     static PMTRL PmtrlNew(int32_t iclrBase = ivNil, int32_t cclr = ivNil);
+     static bool FReadMtrl(PCRF pcrf, CTG ctg, CNO cno, PBLCK pblck, PBACO *ppbaco, int32_t *pcb);
+     static PMTRL PmtrlNewFromPix(PFNI pfni);
+--- a/src/studio/utest.cpp
++++ b/src/studio/utest.cpp
+@@ -355,11 +355,21 @@
+         goto LFail;
+     }
+ 
+-    if (!MTRL::FSetShadeTable(_pcfl, kctgTmap, 0))
+     {
+-        _FGenericError(PszLit("FSetShadeTable"));
+-        _fDontReportInitFailure = fTrue;
+-        goto LFail;
++        int32_t fShadeTextures = klwShadeTexturesDefault;
++        int32_t lwDither = klwDitherDefault;
++
++        (void)FGetSetRegKey(kszShadeTextures, &fShadeTextures, SIZEOF(fShadeTextures), fregNil);
++        (void)FGetSetRegKey(kszDither, &lwDither, SIZEOF(lwDither), fregNil);
++#ifdef BR_ZB_DITHER_BAYER8
++        BrZbSetDither(lwDither != 0 ? BR_ZB_DITHER_BAYER8 : BR_ZB_DITHER_NONE);
++#endif
++        if (!MTRL::FSetShadeTable(_pcfl, kctgTmap, 0, fShadeTextures != 0))
++        {
++            _FGenericError(PszLit("FSetShadeTable"));
++            _fDontReportInitFailure = fTrue;
++            goto LFail;
++        }
+     }
+ 
+     dtsDelay = fStartupSound ? LwBound(kdtsHomeLogo - (TsCurrent() - tsHomeLogo), 0, kdtsHomeLogo) : 1;
+--- a/inc/utest.h
++++ b/inc/utest.h
+@@ -68,6 +68,18 @@
+ 
+ // If fTrue, skip recompressing audio on import
+ #define kszHighQualitySoundImport PszLit("HighQualitySoundImport")
++
++// If not 0, textured objects are shaded by the scene lighting like solid-colour
++// ones.  The original game draws textures unlit.  If the content's shade table
++// (TMAP 0 in 3dmovie.chk) is the stock one, a real one is generated.  If 0, the
++// original look is kept.
++#define kszShadeTextures PszLit("ShadeTextures")
++#define klwShadeTexturesDefault 0
++
++// Dithering of lit surfaces (needs a BRender with BrZbSetDither):
++// 0 = none (original), 1 = Bayer 8x8 ordered dither
++#define kszDither PszLit("Dither")
++#define klwDitherDefault 0
+ #define kszHighQualitySoundImportDefault fFalse
+ 
+ // If fTrue, mix sound in 44.1KHz 16-bit Stereo
+--- a/src/studio/configstub.cpp
++++ b/src/studio/configstub.cpp
+@@ -41,6 +41,12 @@
+     // Enable high quality sound import
+     {kszHighQualitySoundImport, "1", pvNil, pvNil},
+ 
++    // Shade textured objects with the scene lighting
++    {kszShadeTextures, "0", pvNil, pvNil, 0},
++
++    // Dither lit surfaces (0 = off, 1 = Bayer 8x8)
++    {kszDither, "0", pvNil, pvNil, 0},
++
+ };
+ 
+ bool FGetSetRegKey(PCSZ pszValueName, void *pvData, int32_t cbData, uint32_t grfreg, bool *pfNoValue)

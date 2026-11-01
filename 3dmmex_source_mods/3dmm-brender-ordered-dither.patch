@@ -1,0 +1,254 @@
+diff --git a/INC/zbproto.h b/INC/zbproto.h
+index 9bf6242..7a65710 100644
+--- a/INC/zbproto.h
++++ b/INC/zbproto.h
+@@ -32,6 +32,14 @@ extern "C"
+     void BR_PUBLIC_ENTRY BrZbBegin(br_uint_8 colour_type, br_uint_8 depth_type);
+     void BR_PUBLIC_ENTRY BrZbEnd(void);
+ 
++    /*
++     * Ordered dithering of lit surfaces (solid colour ramps and lit textures)
++     */
++#define BR_ZB_DITHER_NONE 0
++#define BR_ZB_DITHER_BAYER8 1
++    void BR_PUBLIC_ENTRY BrZbSetDither(br_int_32 mode);
++    br_int_32 BR_PUBLIC_ENTRY BrZbGetDither(void);
++
+     void BR_PUBLIC_ENTRY BrZbSceneRenderBegin(br_actor *world, br_actor *camera, br_pixelmap *colour_buffer,
+                                               br_pixelmap *depth_buffer);
+ 
+diff --git a/ZB/dither.c b/ZB/dither.c
+index 77d564e..710693d 100644
+--- a/ZB/dither.c
++++ b/ZB/dither.c
+@@ -6,4 +6,81 @@
+  *
+  */
+ 
+-int dither[4][4] = {{13, 8, 10, 3}, {1, 12, 6, 15}, {4, 9, 7, 14}, {16, 5, 11, 2}};
+\ No newline at end of file
++int dither[4][4] = {{13, 8, 10, 3}, {1, 12, 6, 15}, {4, 9, 7, 14}, {16, 5, 11, 2}};
++
++/*
++ * Ordered (Bayer 8x8) dithering of lit surfaces in the z-buffer renderer.
++ *
++ * Lit triangles interpolate an intensity that is quantised to a palette-ramp entry (solid colours) or
++ * a shade-table row (lit textures).  The vertex lighting code adds 0.5 to that value so the plain
++ * truncation rounds to nearest.  When dithering is on, the renderer instead adds a screen-position
++ * dependent threshold in [-0.49,+0.49] before truncating, which gives floor(v + threshold) - an ordered dither
++ * that never leaves [zb_dither_lo, zb_dither_hi] (the material's own ramp).
++ */
++#include "brender.h"
++#include "zb.h"
++
++br_int_32 zb_dither_mode = 0;
++br_int_32 zb_dither_lo = 0;
++br_int_32 zb_dither_hi = 255;
++br_int_32 zb_bayer8[8][8];   /* unit-amplitude threshold offsets, 16.16 */
++br_int_32 zb_dither_tab[8][8]; /* the above scaled by zb_dither_amp: what the renderers use */
++br_int_32 zb_dither_amp = 0;
++static int bayer_ready = 0;
++
++static void BuildBayer8(void)
++{
++    int m[8][8], n, x, y;
++
++    m[0][0] = 0;
++    for (n = 1; n < 8; n *= 2)
++    {
++        for (y = 0; y < n; y++)
++        {
++            for (x = 0; x < n; x++)
++            {
++                int v = m[y][x] * 4;
++                m[y][x] = v;
++                m[y][x + n] = v + 2;
++                m[y + n][x] = v + 3;
++                m[y + n][x + n] = v + 1;
++            }
++        }
++    }
++    /* (2v+1)/128 in [0,1) as a threshold, minus the 0.5 already added by the lighting code, in 16.16 */
++    for (y = 0; y < 8; y++)
++        for (x = 0; x < 8; x++)
++            zb_bayer8[y][x] = (2 * m[y][x] + 1) * 512 - 32768;
++    bayer_ready = 1;
++    zb_dither_amp = 0;
++}
++
++/*
++ * Scale the threshold matrix to an amplitude (16.16, 1.0 = one index step).  Solid colours dither across one ramp
++ * entry.  A lit texture goes through a shade table with many more rows than a ramp has entries, so the noise has to span
++ * the several rows that make up one palette step or the table's own posterisation shows as bands.
++ */
++void ZbDitherSetAmp(br_int_32 amp)
++{
++    int x, y;
++
++    if (!bayer_ready || amp == zb_dither_amp)
++        return;
++    for (y = 0; y < 8; y++)
++        for (x = 0; x < 8; x++)
++            zb_dither_tab[y][x] = (br_int_32)(((long long)zb_bayer8[y][x] * amp) >> 16);
++    zb_dither_amp = amp;
++}
++
++void BR_PUBLIC_ENTRY BrZbSetDither(br_int_32 mode)
++{
++    if (mode != BR_ZB_DITHER_NONE && !bayer_ready)
++        BuildBayer8();
++    ZbDitherSetAmp(0x10000);
++    zb_dither_mode = (mode != BR_ZB_DITHER_NONE) ? BR_ZB_DITHER_BAYER8 : BR_ZB_DITHER_NONE;
++}
++
++br_int_32 BR_PUBLIC_ENTRY BrZbGetDither(void)
++{
++    return zb_dither_mode;
++}
+diff --git a/ZB/t_piza.c b/ZB/t_piza.c
+index 32e771d..1ff0f4b 100644
+--- a/ZB/t_piza.c
++++ b/ZB/t_piza.c
+@@ -44,6 +44,16 @@ static inline void __TriangleRenderZ2(br_boolean use_light, br_boolean use_bump,
+ 
+         is_forward = zb.awsl.start < zb.awsl.end;
+         ptr = zb.awsl.start;
++        const br_int_32 *drow = NULL;
++        br_int_32 rowbase = 0;
++
++        if (use_light && bpp == 1 && zb_dither_mode)
++        {
++            br_uint_8 *lo = zb.awsl.start < zb.awsl.end ? zb.awsl.start : zb.awsl.end;
++            br_int_32 y = (br_int_32)(lo - zb.colour_buffer) / zb.row_width;
++            rowbase = y * zb.row_width;
++            drow = zb_dither_tab[y & 7];
++        }
+         u = (zb.awsl.u_current & 0xFFFF0000) | zb.awsl.u_int_current;
+         v = zb.awsl.v_current;
+ 
+@@ -76,7 +86,10 @@ static inline void __TriangleRenderZ2(br_boolean use_light, br_boolean use_bump,
+                     zptr++;
+                     for (int i = 0; i < bpp; i++)
+                     {
+-                        *ptr = zb.shade_table[*src | ((BrFixedToInt(zb.pi.currentpix) & 0xFF) << 8)];
++                        br_uint_32 row = drow ? (br_uint_32)ZbDitherIndex(zb.pi.currentpix,
++                                                                          drow[(ptr - zb.colour_buffer - rowbase) & 7])
++                                              : (BrFixedToInt(zb.pi.currentpix) & 0xFF);
++                        *ptr = zb.shade_table[*src | (row << 8)];
+                     }
+                     zb.pz.currentpix += zb.pz.grad_x;
+                     ptr += bpp;
+@@ -191,7 +204,10 @@ static inline void __TriangleRenderZ2(br_boolean use_light, br_boolean use_bump,
+                 *zptr = BrFixedToInt(zb.pz.currentpix);
+                 if (use_light)
+                 {
+-                    *ptr = zb.shade_table[*src | ((BrFixedToInt(zb.pi.currentpix) & 0xFF) << 8)];
++                    br_uint_32 row = drow ? (br_uint_32)ZbDitherIndex(zb.pi.currentpix,
++                                                                      drow[(ptr - zb.colour_buffer - rowbase) & 7])
++                                          : (BrFixedToInt(zb.pi.currentpix) & 0xFF);
++                    *ptr = zb.shade_table[*src | (row << 8)];
+                 }
+                 else
+                 {
+diff --git a/ZB/ti8_piz.c b/ZB/ti8_piz.c
+index 8943d93..4d87c9e 100644
+--- a/ZB/ti8_piz.c
++++ b/ZB/ti8_piz.c
+@@ -105,6 +105,15 @@ static inline void __TRAPEZOID_PIZ2I(struct scan_edge *edge, br_boolean is_forwa
+         br_uint_32 z_curr = *z_val;
+         br_uint_32 i_curr = zb.pi.current;
+         br_uint_16 *z_ptr = ((br_uint_16 *)zb.depth_buffer) + fb_curr;
++        const br_int_32 *drow = NULL;
++        br_int_32 rowbase = 0;
++
++        if (zb_dither_mode)
++        {
++            br_int_32 y = (fb_curr < endptr ? fb_curr : endptr) / zb.row_width;
++            rowbase = y * zb.row_width;
++            drow = zb_dither_tab[y & 7];
++        }
+ 
+         // pixel loop
+         if (is_forward)
+@@ -114,7 +123,8 @@ static inline void __TRAPEZOID_PIZ2I(struct scan_edge *edge, br_boolean is_forwa
+                 if (*z_ptr > BrFixedToInt(z_curr))
+                 {
+                     *z_ptr = BrFixedToInt(z_curr);
+-                    zb.colour_buffer[fb_curr] = BrFixedToInt(i_curr);
++                    zb.colour_buffer[fb_curr] =
++                        drow ? ZbDitherIndex(i_curr, drow[(fb_curr - rowbase) & 7]) : BrFixedToInt(i_curr);
+                 }
+                 z_curr += zb.pz.grad_x;
+                 i_curr += zb.pi.grad_x;
+@@ -133,7 +143,8 @@ static inline void __TRAPEZOID_PIZ2I(struct scan_edge *edge, br_boolean is_forwa
+                 if (*z_ptr > BrFixedToInt(z_curr))
+                 {
+                     *z_ptr = BrFixedToInt(z_curr);
+-                    zb.colour_buffer[fb_curr] = BrFixedToInt(i_curr);
++                    zb.colour_buffer[fb_curr] =
++                        drow ? ZbDitherIndex(i_curr, drow[(fb_curr - rowbase) & 7]) : BrFixedToInt(i_curr);
+                 }
+             }
+         }
+@@ -666,4 +677,4 @@ void BR_ASM_CALL TriangleRenderPIZ2TI(struct temp_vertex_fixed *v0, struct temp_
+                                       struct temp_vertex_fixed *v2)
+ {
+     RawTriangle_PIZ2TI(v0, v1, v2);
+-}
+\ No newline at end of file
++}
+\ No newline at end of file
+diff --git a/ZB/zb.h b/ZB/zb.h
+index 74cc8b8..a46132c 100644
+--- a/ZB/zb.h
++++ b/ZB/zb.h
+@@ -362,6 +362,22 @@ typedef int screen_scalar;
+ 
+     extern br_zbuffer_state BR_ASM_DATA zb;
+ 
++    /*
++     * Ordered dither state (dither.c)
++     */
++    extern br_int_32 zb_dither_mode;
++    extern br_int_32 zb_dither_lo, zb_dither_hi;
++    extern br_int_32 zb_bayer8[8][8];
++    extern br_int_32 zb_dither_tab[8][8];
++    void ZbDitherSetAmp(br_int_32 amp);
++
++    /* intensity (16.16, already biased by +0.5) plus the Bayer offset for this pixel, truncated and kept inside the ramp */
++    static inline br_int_32 ZbDitherIndex(br_uint_32 i, br_int_32 off)
++    {
++        br_int_32 v = (br_int_32)(i + (br_uint_32)off) >> 16;
++        return v < zb_dither_lo ? zb_dither_lo : (v > zb_dither_hi ? zb_dither_hi : v);
++    }
++
+     /*
+      * Transform into screen space - Inline expanded BrMatrix4ApplyP()
+      */
+diff --git a/ZB/zbmesh.c b/ZB/zbmesh.c
+index 221fb51..bdee5b9 100644
+--- a/ZB/zbmesh.c
++++ b/ZB/zbmesh.c
+@@ -461,6 +461,22 @@ static void ZbRenderFaces(void)
+         if (zb.material->index_shade)
+             zb.shade_table = zb.material->index_shade->pixels;
+ 
++        if (zb.material->colour_map && zb.material->index_shade)
++        {
++            zb_dither_lo = 0;
++            zb_dither_hi = zb.material->index_shade->height - 1;
++            /* one palette step is about (rows - 1) / 7 rows of the shade table (8 shades per ramp) */
++            if (zb_dither_mode)
++                ZbDitherSetAmp((br_int_32)(((long long)zb_dither_hi << 16) / 7));
++        }
++        else
++        {
++            zb_dither_lo = zb.material->index_base;
++            zb_dither_hi = zb.material->index_base + zb.material->index_range;
++            if (zb_dither_mode)
++                ZbDitherSetAmp(0x10000);
++        }
++
+         /*
+          * Call the face group render function
+          */

@@ -1,0 +1,52 @@
+--- a/src/engine/modl.cpp
++++ b/src/engine/modl.cpp
+@@ -15,6 +15,12 @@
+ RTCLASS(MODL)
+ 
+ bool MODL::_fKeepOriginals = fFalse;
++static bool _fSmoothUngrouped = fFalse;
++
++void MODL::SetSmoothUngrouped(bool fSmooth)
++{
++    _fSmoothUngrouped = fSmooth;
++}
+ 
+ /***************************************************************************
+     Create a new PMODL based on some vertices and faces.
+@@ -151,6 +157,8 @@
+ 
+             pbrf->material = pvNil;
+             pbrf->smoothing = pbrff->smoothing;
++            if (pbrf->smoothing == 0 && _fSmoothUngrouped)
++                pbrf->smoothing = (uint16_t)~0;
+             pbrf->flags = pbrff->flags;
+             pbrf->n = pbrff->n;
+             pbrf->d = pbrff->d;
+--- a/inc/modl.h
++++ b/inc/modl.h
+@@ -108,6 +108,14 @@
+         _fKeepOriginals = fKeep;
+     }
+ 
++    // Faces that are in no smoothing group (group 0, which 7gen's MD2
++    // converter writes) get no vertex normals from BRender - every vertex ends
++    // up with the same normal, so a lit model is one flat shade that changes as
++    // it turns.  BRender's own model loader treats group 0 as "all groups"; with
++    // this set, so do we, for models that are not prepared.  Set it before any
++    // model is loaded.
++    static void SetSmoothUngrouped(bool fSmooth);
++
+     // Frame interpolation: blending one model into another.  Two models can
+     // be blended if both kept their originals and have the same vertices
+     // joined into the same faces (they differ in where the vertices are, as
+--- a/src/studio/utest.cpp
++++ b/src/studio/utest.cpp
+@@ -364,6 +364,8 @@
+ #ifdef BR_ZB_DITHER_BAYER8
+         BrZbSetDither(lwDither != 0 ? BR_ZB_DITHER_BAYER8 : BR_ZB_DITHER_NONE);
+ #endif
++        // Lit textures need vertex normals; models from 7gen's MD2 converter have none (smoothing group 0)
++        MODL::SetSmoothUngrouped(fShadeTextures != 0);
+         if (!MTRL::FSetShadeTable(_pcfl, kctgTmap, 0, fShadeTextures != 0))
+         {
+             _FGenericError(PszLit("FSetShadeTable"));
