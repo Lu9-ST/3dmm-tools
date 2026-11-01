@@ -20,6 +20,11 @@ Converts TTF/OTF fonts to 3DMM 3D Words.
 Git patches to apply to the [3DMMEx repo](https://github.com/benstone/3DMMEx) **(specifically commit 9a44314)**. They are:
 - Frame Interpolation + Vertex Blending (Multiplier, 1x = 6 FPS, 10x max)
 - "Quick New" setting + v3DMM VXP Expansion loading (apply *after* applying previous patch)
+- Lighting and shading toggle
+- (BRender patch) Bayer 8x8 Dithering
+- Smooth ungrouped faces (for 7gen MD2 conversions)
+- Flat whitelist (INI setting to disable lighting for specified VXPs)
+- Light prop (Adds a point light prop, up to 6 can be added)
   
 Primarily for personal use. Might be very sloppy! Do not submit as PRs until it is more properly tested and verified. You have been warned.
 
